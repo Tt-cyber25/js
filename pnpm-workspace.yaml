@@ -1,5 +1,5 @@
 packages:
 - packages/*
 - apps/*
-
-
+# Ứng dụng độc lập, không phụ thuộc thư viện, không dùng chung lockfile của monorepo
+- "!apps/asset-exchange"
