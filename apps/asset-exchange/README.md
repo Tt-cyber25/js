@@ -1,6 +1,6 @@
 # TokenVN – Sàn số hóa & giao dịch chia nhỏ tài sản thực
 
-MVP web-app (PWA, ưu tiên điện thoại) để **số hóa, gọi vốn chia nhỏ và giao dịch** 6 loại tài sản:
+MVP web-app (PWA, ưu tiên điện thoại) để **số hóa, gọi vốn chia nhỏ và giao dịch liên tục như cổ phiếu/coin** 6 loại tài sản:
 
 | Loại | Mã | Thu nhập chia cổ tức | Sự kiện tạm ngừng giao dịch |
 |---|---|---|---|
@@ -21,16 +21,39 @@ Yêu cầu **Node.js ≥ 22.13**. Không cần cài thư viện nào (dùng `nod
 cd apps/asset-exchange
 cp .env.example .env      # tùy chọn
 npm start                 # http://localhost:3000 — lần đầu tự tạo dữ liệu mẫu
-npm test                  # 15 test cho sổ cái + bảo mật API
+npm test                  # 23 test: sổ cái, khớp lệnh, ví, bảo mật API
 ```
 
 Tài khoản demo (mật khẩu `Demo@12345`): `admin@demo.vn`, `owner@demo.vn`, `owner2@demo.vn`, `investor@demo.vn`, `investor2@demo.vn`, `investor3@demo.vn`.
 
 Ở môi trường dev, màn hình thanh toán có nút **"Mô phỏng ngân hàng báo có"**: server tự ký HMAC rồi đi đúng luồng webhook như ngân hàng thật. Khi `NODE_ENV=production` nút này và API của nó bị tắt.
 
+## Sàn giao dịch (v2)
+
+Được xây dựng từ phần nghiên cứu các app VNDirect, TCBS, SSI và Binance (xem [docs/NGHIEN_CUU_SAN_GIAO_DICH.md](docs/NGHIEN_CUU_SAN_GIAO_DICH.md)):
+
+- **Bảng giá thời gian thực** (SSE): màu trần/sàn/tham chiếu, 3 bước giá mua/bán, nhấp nháy khi giá đổi, chế độ gọn hoặc đầy đủ, danh sách ★ theo dõi.
+- **Màn hình giao dịch:**
+  - biểu đồ nến 15m/1h/4h/1D kèm MA(7) và khối lượng;
+  - sổ lệnh có thanh độ sâu, bấm vào giá để điền vào form;
+  - lịch sử khớp lệnh;
+  - form đặt lệnh **LO / MP / Dừng (stop-limit)**, nút 25–100%, xem trước phí và thuế;
+  - các tab lệnh chờ, lịch sử lệnh, khớp của tôi, cảnh báo giá.
+- **Bộ khớp lệnh liên tục** (`src/exchange.js`):
+  - ưu tiên giá rồi thời gian, khớp tại giá của lệnh chờ;
+  - biên độ ±10% quanh giá tham chiếu (giá đóng cửa ngày trước, theo giờ Việt Nam), bước giá 10đ;
+  - phí 0,15% mỗi bên, thuế thu nhập cá nhân 0,1% khi bán;
+  - chống tự khớp; lệnh MP chỉ khớp với lượng đang có trên sổ, phần còn lại tự hủy và hoàn tiền phong tỏa dư.
+- **Ví tiền:** nạp bằng VietQR (webhook ghi có đúng số tiền thực nhận), rút về tài khoản chính chủ qua bảng kê chờ duyệt; mua sơ cấp được trả ngay bằng số dư ví.
+- **Tài sản (NAV):** tiền khả dụng và phong tỏa, giá trị token, lãi/lỗ, giá vốn bình quân, cổ tức.
+- Khi admin **tạm ngừng giao dịch** hoặc tất toán, mọi lệnh tự hủy và tiền/token phong tỏa được hoàn lại.
+- Có test **bảo toàn tiền**: tổng tiền nạp luôn bằng số dư cộng phí và thuế.
+
+> Nâng cấp từ bản cũ: cấu trúc cơ sở dữ liệu đã thay đổi. Hãy **xóa thư mục `data`** rồi chạy lại `npm start` để tạo dữ liệu mẫu mới, kèm 20 ngày lịch sử khớp lệnh.
+
 ## Tính năng
 
-**Nhà đầu tư:** đăng ký, eKYC, xem thị trường theo loại tài sản, chi tiết tài sản (biểu đồ giá, báo cáo thu nhập P&L, hồ sơ pháp lý đã che, SPV và chứng thư lưu ký), mua sơ cấp bằng mã VietQR định danh, mua bán thứ cấp OTC, biểu quyết, danh mục (tài sản ròng, lãi/lỗ, lịch sử cổ tức), giấy xác nhận sở hữu có dấu niêm phong SHA-256 (in hoặc lưu PDF), thông báo.
+**Nhà đầu tư:** đăng ký, eKYC, xem thị trường theo loại tài sản, chi tiết tài sản (biểu đồ giá, báo cáo thu nhập P&L, hồ sơ pháp lý đã che, SPV và chứng thư lưu ký), mua sơ cấp bằng mã VietQR định danh, mua bán trên sàn khớp lệnh, biểu quyết, danh mục (tài sản ròng, lãi/lỗ, lịch sử cổ tức), giấy xác nhận sở hữu có dấu niêm phong SHA-256 (in hoặc lưu PDF), thông báo.
 
 **Chủ tài sản:** gửi hồ sơ niêm yết với trường thông tin và bộ hồ sơ bắt buộc riêng cho từng loại tài sản; đề xuất chuộc lại tài sản (Call Option).
 
@@ -64,7 +87,8 @@ src/config.js      cấu hình, đọc .env
 src/assetTypes.js  danh mục 6 loại tài sản (trường, hồ sơ bắt buộc, nhãn)
 src/db.js          schema SQLite, transaction, audit hash-chain
 src/auth.js        scrypt, JWT, HMAC
-src/ledger.js      LÕI SỔ CÁI: đơn hàng, webhook, OTC, cổ tức, biểu quyết, thoái vốn, tạm ngừng
+src/ledger.js      LÕI SỔ CÁI: gọi vốn, webhook, cổ tức, biểu quyết, thoái vốn, tạm ngừng
+src/exchange.js    SÀN: ví tiền, khớp lệnh, biên độ, lệnh dừng, cảnh báo giá, nến, sổ lệnh
 src/server.js      HTTP API + phục vụ PWA
 src/seed.js        dữ liệu mẫu
 public/            giao diện (HTML/CSS/JS thuần)

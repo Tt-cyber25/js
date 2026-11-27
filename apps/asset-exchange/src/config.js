@@ -39,7 +39,12 @@ export const config = {
     accountName: env.ESCROW_ACCOUNT_NAME || "CONG TY SPV DEMO",
   },
   platformFeeBps: BigInt(env.PLATFORM_FEE_BPS || 500),
-  otcFeeBps: BigInt(env.OTC_FEE_BPS || 50),
+  // Sàn khớp lệnh: phí giao dịch mỗi bên, thuế TNCN khi bán (0,1% giá trị chuyển nhượng),
+  // biên độ giá quanh giá tham chiếu, bước giá
+  tradeFeeBps: BigInt(env.TRADE_FEE_BPS || 15),
+  sellTaxBps: BigInt(env.SELL_TAX_BPS || 10),
+  bandBps: BigInt(env.PRICE_BAND_BPS || 1000),
+  tickSize: BigInt(env.TICK_SIZE || 10),
   dividendTaxBps: BigInt(env.DIVIDEND_TAX_BPS || 500),
   orderTtlMinutes: Number(env.ORDER_TTL_MINUTES || 30),
   // Cho phép API mô phỏng ngân hàng (chỉ khi không phải production)

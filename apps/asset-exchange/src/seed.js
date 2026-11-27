@@ -90,7 +90,6 @@ export function seed(ledger, db) {
   ledger.activateAsset(admin, pt.id);
   ledger.distributeMonthlyRent(admin, pt.id, 12_000_000, { period: "2026-09" });
   ledger.distributeMonthlyRent(admin, pt.id, 12_500_000, { period: "2026-10" });
-  ledger.createOtcListing(inv2, pt.id, 5_000, 11_200);
   ledger.createProposal(inv1, pt.id, {
     proposal_type: "VALUE_ADD_5_10_PERCENT",
     title: "Mở rộng li-xăng sang thị trường Campuchia",
@@ -164,6 +163,73 @@ export function seed(ledger, db) {
   buy(inv2, at.id, 6_000);
   buy(inv3, at.id, 4_000);
   ledger.activateAsset(admin, at.id);
+
+  seedMarket(ledger, db, {
+    users: { ownerA, ownerB, inv1, inv2, inv3 },
+    assets: [
+      { id: pt.id, sellers: [ownerB, inv2, inv3], buyers: [inv1, inv2, inv3, ownerA], drift: 0.004 },
+      { id: ip.id, sellers: [ownerB, inv1, inv3], buyers: [inv1, inv2, inv3, ownerA], drift: 0.002 },
+      { id: at.id, sellers: [ownerB, inv2, inv3], buyers: [inv1, inv2, inv3, ownerA], drift: 0.006 },
+    ],
+  });
+}
+
+// Tạo lịch sử khớp lệnh ~20 ngày + sổ lệnh chờ để bảng giá/biểu đồ có dữ liệu.
+// Mọi giao dịch đều đi qua bộ khớp lệnh thật, sau đó chỉ lùi thời điểm ghi nhận.
+function seedMarket(ledger, db, { users, assets }) {
+  const ex = ledger.exchange;
+  let seed = 20261127;
+  const rnd = () => {
+    seed = (seed * 1103515245 + 12345) % 2147483648;
+    return seed / 2147483648;
+  };
+  for (const id of Object.values(users)) {
+    const d = ex.createDeposit(id, 2_000_000_000);
+    ledger.handleBankPayment({ reference_code: d.reference_code, amount: d.amount, bank_txn_id: `SEED-${d.reference_code}` });
+  }
+  const tick = 10;
+  const toTick = (x) => BigInt(Math.max(tick, Math.round(x / tick) * tick));
+  const steps = 60;
+  const now = Date.now();
+  for (const spec of assets) {
+    let price = 10000;
+    for (let i = 0; i < steps; i++) {
+      price = price * (1 + spec.drift + (rnd() - 0.5) * 0.03);
+      const p = toTick(price);
+      const seller = spec.sellers[i % spec.sellers.length];
+      let buyer = spec.buyers[Math.floor(rnd() * spec.buyers.length)];
+      if (buyer === seller) buyer = spec.buyers.find((b) => b !== seller);
+      const qty = BigInt(50 + Math.floor(rnd() * 400));
+      try {
+        ex.placeOrder(seller, { asset_id: spec.id, side: "SELL", type: "LIMIT", price: p, quantity: qty });
+        ex.placeOrder(buyer, { asset_id: spec.id, side: "BUY", type: "LIMIT", price: p, quantity: qty });
+      } catch {
+        continue; // ví dụ vượt biên độ: bỏ qua bước này
+      }
+      const at = new Date(now - (steps - i) * 8 * 3600 * 1000).toISOString().replace("T", " ").slice(0, 19);
+      db.run("UPDATE trades SET created_at = ? WHERE id = (SELECT MAX(id) FROM trades)", at);
+      db.run("UPDATE price_history SET recorded_at = ? WHERE id = (SELECT MAX(id) FROM price_history)", at);
+      price = Number(p);
+    }
+    // Sổ lệnh chờ: 5 bước giá mỗi bên quanh giá gần nhất
+    const asset = db.get("SELECT * FROM assets WHERE id = ?", spec.id);
+    const last = Number(ex.lastPrice(asset));
+    const band = ex.priceBand(asset);
+    for (let k = 1; k <= 5; k++) {
+      const ask = toTick(last * (1 + 0.004 * k));
+      const bid = toTick(last * (1 - 0.004 * k));
+      const s = spec.sellers[k % spec.sellers.length];
+      const b = spec.buyers[k % spec.buyers.length];
+      const place = (u, side, price, quantity) => {
+        try {
+          ex.placeOrder(u, { asset_id: spec.id, side, type: "LIMIT", price, quantity });
+        } catch {}
+      };
+      if (ask <= band.ceiling) place(s, "SELL", ask, BigInt(100 * k + Math.floor(rnd() * 200)));
+      if (bid >= band.floor && b !== s) place(b, "BUY", bid, BigInt(120 * k + Math.floor(rnd() * 200)));
+    }
+  }
+  db.run("DELETE FROM notifications WHERE title IN ('Nạp tiền thành công')");
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

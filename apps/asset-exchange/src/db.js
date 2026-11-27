@@ -5,6 +5,8 @@ import { DatabaseSync } from "node:sqlite";
 
 // Quy ước: mọi số tiền (VND) và số token lưu INTEGER (int64) và đọc ra dưới dạng BigInt.
 // Không bao giờ dùng số thực cho tiền. Tỷ lệ % lưu dạng basis points (1% = 100 bps).
+const SCHEMA_VERSION = 2;
+
 const SCHEMA = `
 PRAGMA foreign_keys = ON;
 PRAGMA journal_mode = WAL;
@@ -84,32 +86,18 @@ CREATE TABLE IF NOT EXISTS user_holdings (
   UNIQUE (user_id, asset_id)
 );
 
-CREATE TABLE IF NOT EXISTS otc_listings (
-  id TEXT PRIMARY KEY,
-  asset_id TEXT NOT NULL REFERENCES assets(id),
-  seller_id TEXT NOT NULL REFERENCES users(id),
-  token_amount INTEGER NOT NULL CHECK (token_amount > 0),
-  remaining_tokens INTEGER NOT NULL CHECK (remaining_tokens >= 0),
-  reserved_tokens INTEGER NOT NULL DEFAULT 0 CHECK (reserved_tokens >= 0),
-  price_per_token INTEGER NOT NULL CHECK (price_per_token > 0),
-  status TEXT NOT NULL DEFAULT 'OPEN' CHECK (status IN ('OPEN','FILLED','CANCELLED')),
-  created_at TEXT NOT NULL DEFAULT (datetime('now')),
-  CHECK (reserved_tokens <= remaining_tokens)
-);
-
 CREATE TABLE IF NOT EXISTS transactions (
   id TEXT PRIMARY KEY,
   reference_code TEXT NOT NULL UNIQUE,
   user_id TEXT NOT NULL REFERENCES users(id),
-  asset_id TEXT NOT NULL REFERENCES assets(id),
+  asset_id TEXT REFERENCES assets(id),
   type TEXT NOT NULL CHECK (type IN
-    ('BUY_PRIMARY','BUY_OTC','SELL_OTC','DIVIDEND','RENT_PAYMENT','REFUND','EXIT_PAYOUT','OWNER_DISBURSEMENT')),
+    ('BUY_PRIMARY','DEPOSIT','WITHDRAWAL','DIVIDEND','RENT_PAYMENT','REFUND','EXIT_PAYOUT','OWNER_DISBURSEMENT')),
   token_amount INTEGER NOT NULL DEFAULT 0,
   fiat_amount INTEGER NOT NULL DEFAULT 0,
   fee_amount INTEGER NOT NULL DEFAULT 0,
   tax_amount INTEGER NOT NULL DEFAULT 0,
   net_amount INTEGER NOT NULL DEFAULT 0,
-  listing_id TEXT REFERENCES otc_listings(id),
   batch_id TEXT,
   bank_txn_id TEXT,
   status TEXT NOT NULL DEFAULT 'PENDING' CHECK (status IN
@@ -175,8 +163,8 @@ CREATE TABLE IF NOT EXISTS income_reports (
 
 CREATE TABLE IF NOT EXISTS payout_batches (
   id TEXT PRIMARY KEY,
-  asset_id TEXT NOT NULL REFERENCES assets(id),
-  kind TEXT NOT NULL CHECK (kind IN ('DIVIDEND','EXIT','REFUND','OTC','OWNER_DISBURSEMENT','BUYBACK')),
+  asset_id TEXT REFERENCES assets(id),
+  kind TEXT NOT NULL CHECK (kind IN ('DIVIDEND','EXIT','REFUND','WITHDRAWAL','OWNER_DISBURSEMENT','BUYBACK')),
   status TEXT NOT NULL DEFAULT 'PENDING_APPROVAL' CHECK (status IN ('PENDING_APPROVAL','PAID')),
   total_amount INTEGER NOT NULL,
   line_count INTEGER NOT NULL,
@@ -192,6 +180,63 @@ CREATE TABLE IF NOT EXISTS notifications (
   body TEXT NOT NULL,
   severity TEXT NOT NULL DEFAULT 'INFO' CHECK (severity IN ('INFO','WARNING','CRITICAL')),
   is_read INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Ví tiền của nhà đầu tư (tiểu khoản trên sổ cái; tiền thật nằm trong tài khoản phong tỏa ngân hàng)
+CREATE TABLE IF NOT EXISTS cash_accounts (
+  user_id TEXT PRIMARY KEY REFERENCES users(id),
+  available INTEGER NOT NULL DEFAULT 0 CHECK (available >= 0),
+  locked INTEGER NOT NULL DEFAULT 0 CHECK (locked >= 0)
+);
+
+CREATE TABLE IF NOT EXISTS orders (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id),
+  asset_id TEXT NOT NULL REFERENCES assets(id),
+  side TEXT NOT NULL CHECK (side IN ('BUY','SELL')),
+  type TEXT NOT NULL CHECK (type IN ('LIMIT','MARKET','STOP_LIMIT')),
+  price INTEGER,
+  stop_price INTEGER,
+  quantity INTEGER NOT NULL CHECK (quantity > 0),
+  filled_quantity INTEGER NOT NULL DEFAULT 0,
+  filled_value INTEGER NOT NULL DEFAULT 0,
+  locked_cash INTEGER NOT NULL DEFAULT 0 CHECK (locked_cash >= 0),
+  tif TEXT NOT NULL DEFAULT 'GTC' CHECK (tif IN ('GTC','IOC')),
+  status TEXT NOT NULL CHECK (status IN ('PENDING_TRIGGER','OPEN','PARTIAL','FILLED','CANCELLED')),
+  cancel_reason TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  CHECK (filled_quantity <= quantity)
+);
+CREATE INDEX IF NOT EXISTS idx_orders_book ON orders(asset_id, side, status, price);
+CREATE INDEX IF NOT EXISTS idx_orders_user ON orders(user_id, status);
+
+CREATE TABLE IF NOT EXISTS trades (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  asset_id TEXT NOT NULL REFERENCES assets(id),
+  price INTEGER NOT NULL,
+  quantity INTEGER NOT NULL,
+  buy_order_id TEXT NOT NULL,
+  sell_order_id TEXT NOT NULL,
+  buyer_id TEXT NOT NULL,
+  seller_id TEXT NOT NULL,
+  taker_side TEXT NOT NULL,
+  buyer_fee INTEGER NOT NULL,
+  seller_fee INTEGER NOT NULL,
+  seller_tax INTEGER NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_trades_asset ON trades(asset_id, created_at);
+
+CREATE TABLE IF NOT EXISTS price_alerts (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id),
+  asset_id TEXT NOT NULL REFERENCES assets(id),
+  direction TEXT NOT NULL CHECK (direction IN ('ABOVE','BELOW')),
+  price INTEGER NOT NULL,
+  active INTEGER NOT NULL DEFAULT 1,
+  triggered_at TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -216,7 +261,15 @@ BEGIN SELECT RAISE(ABORT, 'audit_logs is append-only'); END;
 export function openDb(path) {
   if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true });
   const db = new DatabaseSync(path);
+  const version = Number(db.prepare("PRAGMA user_version").get().user_version);
+  const hasTables = !!db.prepare("SELECT 1 FROM sqlite_master WHERE name = 'users'").get();
+  if (hasTables && version < SCHEMA_VERSION) {
+    throw new Error(
+      `Cơ sở dữ liệu tại ${path} dùng cấu trúc cũ (v${version}). Đây là bản demo: hãy xóa thư mục data rồi chạy lại để tạo dữ liệu mới.`,
+    );
+  }
   db.exec(SCHEMA);
+  db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
   return wrap(db);
 }
 

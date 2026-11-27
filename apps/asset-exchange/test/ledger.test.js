@@ -12,7 +12,10 @@ const config = {
   webhookSecret: "test-webhook-secret-test-webhook-1234",
   escrow: { bankId: "970422", accountNo: "123", accountName: "SPV TEST" },
   platformFeeBps: 500n,
-  otcFeeBps: 50n,
+  tradeFeeBps: 15n,
+  sellTaxBps: 10n,
+  bandBps: 1000n,
+  tickSize: 10n,
   dividendTaxBps: 500n,
   orderTtlMinutes: 30,
   allowBankSimulator: true,
@@ -156,7 +159,7 @@ describe("Biểu quyết", () => {
     const pid = L.createProposal(i1, asset, { proposal_type: "FULL_EXIT_SALE", title: "Bán", proposed_price: 1_500_000_000 });
     assert.equal(L.castVote(pid, i1, "AGREE").status, "VOTING");
     assert.throws(() => L.castVote(pid, i1, "AGREE"), /đã biểu quyết/);
-    assert.throws(() => L.createOtcListing(i1, asset, 10, 11_000), /bị khóa chuyển nhượng/);
+    assert.throws(() => L.exchange.placeOrder(i1, { asset_id: asset, side: "SELL", price: 10_000, quantity: 10 }), /bị khóa chuyển nhượng/);
     // owner 70% phản đối → không thể vượt 75% → bác bỏ sớm
     assert.equal(L.castVote(pid, owner, "DISAGREE").status, "REJECTED");
   });
@@ -198,42 +201,150 @@ describe("Ma trận thoái vốn", () => {
   });
 });
 
-describe("OTC & tạm ngừng giao dịch", () => {
-  it("khớp lệnh OTC chuyển token, trừ phí người bán; tạm ngừng hủy lệnh và trả token", () => {
-    const { L, db, adminId, i1, i2, asset, pay, hold } = scenario();
-    pay(L.createPrimaryOrder(i1, asset, 20_000));
-    L.activateAsset(adminId, asset);
-    const listing = L.createOtcListing(i1, asset, 5_000, 12_000);
-    pay(L.createOtcOrder(i2, listing, 2_000));
-    assert.equal(hold(i2, asset).available_tokens, 2_000n);
-    assert.equal(hold(i1, asset).locked_tokens, 3_000n);
-    const sale = db.get("SELECT * FROM transactions WHERE type = 'SELL_OTC' AND user_id = ?", i1);
-    assert.equal(sale.fee_amount, 120_000n);
-    assert.equal(sale.net_amount, 23_880_000n);
+function market() {
+  const s = scenario();
+  const { L, adminId, i1, i2, asset, pay } = s;
+  pay(L.createPrimaryOrder(i1, asset, 20_000));
+  pay(L.createPrimaryOrder(i2, asset, 10_000));
+  L.activateAsset(adminId, asset);
+  const deposit = (u, amt) => {
+    const d = L.exchange.createDeposit(u, amt);
+    return L.handleBankPayment({ reference_code: d.reference_code, amount: d.amount });
+  };
+  const cashOf = (u) => s.db.get("SELECT * FROM cash_accounts WHERE user_id = ?", u);
+  const order = (u, o) => L.exchange.placeOrder(u, { asset_id: asset, type: "LIMIT", ...o });
+  return { ...s, ex: L.exchange, deposit, cashOf, order };
+}
 
-    const pending = L.createOtcOrder(i2, listing, 1_000);
-    L.triggerPlanningHalt(adminId, asset, "https://example.gov.vn/thong-bao.pdf");
-    assert.equal(hold(i1, asset).locked_tokens, 0n);
-    assert.equal(hold(i1, asset).available_tokens, 18_000n);
-    assert.equal(db.get("SELECT status FROM transactions WHERE id = ?", pending.transaction_id).status, "CANCELLED");
-    assert.throws(() => L.createOtcListing(i1, asset, 10, 10_000), /không cho phép/);
-    assert.ok(L.checkInvariants(asset).ok);
-    assert.ok(db.get("SELECT 1 FROM notifications WHERE user_id = ? AND severity = 'CRITICAL'", i2));
+describe("Ví tiền", () => {
+  it("nạp qua webhook ghi có số tiền thực nhận; rút tạo bảng kê chờ duyệt", () => {
+    const { deposit, cashOf, i1, L, db } = market();
+    assert.equal(deposit(i1, 5_000_000).result, "COMPLETED");
+    assert.equal(cashOf(i1).available, 5_000_000n);
+    const w = L.exchange.requestWithdrawal(i1, 1_000_000);
+    assert.equal(cashOf(i1).available, 4_000_000n);
+    assert.equal(db.get("SELECT status FROM transactions WHERE id = ?", w.transaction_id).status, "AWAITING_PAYOUT");
+    assert.throws(() => L.exchange.requestWithdrawal(i1, 99_000_000), { code: "INSUFFICIENT_CASH" });
   });
 
-  it("hủy lệnh bán khi còn đơn đang giữ chỗ: đơn hết hạn thì token trả về người bán", () => {
-    const { L, db, adminId, i1, i2, asset, pay, hold } = scenario();
-    pay(L.createPrimaryOrder(i1, asset, 20_000));
-    L.activateAsset(adminId, asset);
-    const listing = L.createOtcListing(i1, asset, 5_000, 12_000);
-    const o = L.createOtcOrder(i2, listing, 1_000);
-    L.cancelListing(i1, listing);
-    assert.equal(hold(i1, asset).locked_tokens, 1_000n);
-    db.run("UPDATE transactions SET expires_at = datetime('now', '-1 minute') WHERE id = ?", o.transaction_id);
-    assert.equal(L.expireStaleOrders(), 1);
+  it("mua sơ cấp bằng số dư ví hoàn tất ngay", () => {
+    const s = scenario();
+    const d = s.L.exchange.createDeposit(s.i1, 1_000_000);
+    s.L.handleBankPayment({ reference_code: d.reference_code, amount: d.amount });
+    const r = s.L.createPrimaryOrder(s.i1, s.asset, 100, { fromWallet: true });
+    assert.equal(r.paid_from_wallet, true);
+    assert.equal(s.hold(s.i1, s.asset).locked_tokens, 100n);
+    assert.equal(s.db.get("SELECT available FROM cash_accounts WHERE user_id = ?", s.i1).available, 0n);
+  });
+});
+
+describe("Sàn khớp lệnh", () => {
+  it("khớp ưu tiên giá → thời gian tại giá lệnh chờ; phí 0,15% mỗi bên, thuế bán 0,1%", () => {
+    const { ex, order, deposit, cashOf, hold, i1, i2, user, kyc, asset, db } = market();
+    const i3 = user("i3");
+    kyc(i3);
+    deposit(i3, 50_000_000);
+    order(i1, { side: "SELL", price: 10_200, quantity: 300 }); // A1
+    order(i2, { side: "SELL", price: 10_100, quantity: 200 }); // A2 – giá tốt hơn
+    order(i1, { side: "SELL", price: 10_100, quantity: 100 }); // A3 – cùng giá, đến sau
+    const o = order(i3, { side: "BUY", price: 10_200, quantity: 400 });
+    assert.equal(o.status, "FILLED");
+    const trades = db.all("SELECT price, quantity, seller_id FROM trades ORDER BY id");
+    assert.deepEqual(trades.map((t) => [t.price, t.quantity, t.seller_id]), [
+      [10_100n, 200n, i2],
+      [10_100n, 100n, i1],
+      [10_200n, 100n, i1],
+    ]);
+    const cost = 300n * 10_100n + 100n * 10_200n; // 4.050.000
+    const buyerFee = (200n * 10_100n * 15n) / 10000n + (100n * 10_100n * 15n) / 10000n + (100n * 10_200n * 15n) / 10000n;
+    assert.equal(cashOf(i3).available, 50_000_000n - cost - buyerFee);
+    assert.equal(cashOf(i3).locked, 0n);
+    assert.equal(hold(i3, asset).available_tokens, 400n);
+    // i2 bán 200 @ 10.100 = 2.020.000, phí 3.030, thuế 2.020
+    assert.equal(cashOf(i2).available, 2_020_000n - 3_030n - 2_020n);
+    assert.equal(hold(i1, asset).locked_tokens, 200n); // còn 200 của lệnh A1
+    assert.equal(ex.depth(asset).asks[0].price, 10_200n);
+  });
+
+  it("lệnh khớp một phần nằm lại sổ; hủy thì hoàn đúng phần phong tỏa", () => {
+    const { order, deposit, cashOf, i1, i2, ex } = market();
+    deposit(i2, 10_000_000);
+    order(i1, { side: "SELL", price: 10_000, quantity: 100 });
+    const b = order(i2, { side: "BUY", price: 10_000, quantity: 300 });
+    assert.equal(b.status, "PARTIAL");
+    assert.equal(b.locked_cash, ex.reserveFor(200n, 10_000n));
+    ex.cancelOrder(i2, b.id);
+    assert.equal(cashOf(i2).locked, 0n);
+    assert.equal(cashOf(i2).available, 10_000_000n - 1_000_000n - 1_500n);
+  });
+
+  it("lệnh thị trường (MP) khớp đến hết thanh khoản rồi hủy phần còn lại, hoàn tiền phong tỏa dư", () => {
+    const { order, deposit, cashOf, i1, i2, ex, asset } = market();
+    deposit(i2, 10_000_000);
+    order(i1, { side: "SELL", price: 10_000, quantity: 100 });
+    order(i1, { side: "SELL", price: 10_500, quantity: 100 });
+    const m = ex.placeOrder(i2, { asset_id: asset, side: "BUY", type: "MARKET", quantity: 500 });
+    assert.equal(m.status, "CANCELLED");
+    assert.equal(m.filled_quantity, 200n);
+    assert.equal(cashOf(i2).locked, 0n);
+    const spent = 1_000_000n + 1_050_000n + 1_500n + 1_575n;
+    assert.equal(cashOf(i2).available, 10_000_000n - spent);
+  });
+
+  it("kiểm tra biên độ giá ±10% và bước giá", () => {
+    const { order, i1 } = market();
+    assert.throws(() => order(i1, { side: "SELL", price: 11_010, quantity: 1 }), { code: "OUT_OF_BAND" });
+    assert.throws(() => order(i1, { side: "SELL", price: 8_990, quantity: 1 }), { code: "OUT_OF_BAND" });
+    assert.throws(() => order(i1, { side: "SELL", price: 10_005, quantity: 1 }), /bước giá/);
+    assert.equal(order(i1, { side: "SELL", price: 11_000, quantity: 1 }).status, "OPEN");
+  });
+
+  it("lệnh dừng (stop-limit) kích hoạt khi giá khớp chạm ngưỡng", () => {
+    const { order, deposit, i1, i2, ex, asset, db } = market();
+    deposit(i2, 20_000_000);
+    const stop = ex.placeOrder(i1, { asset_id: asset, side: "SELL", type: "STOP_LIMIT", stop_price: 9_800, price: 9_700, quantity: 50 });
+    assert.equal(stop.status, "PENDING_TRIGGER");
+    order(i2, { side: "BUY", price: 9_700, quantity: 50 }); // bid chờ cho lệnh dừng
+    order(i1, { side: "SELL", price: 9_800, quantity: 10 });
+    order(i2, { side: "BUY", price: 9_800, quantity: 10 }); // khớp 9.800 → kích hoạt
+    assert.equal(db.get("SELECT status FROM orders WHERE id = ?", stop.id).status, "FILLED");
+  });
+
+  it("chống tự khớp: lệnh chờ của chính mình bị hủy thay vì khớp", () => {
+    const { order, deposit, i1, db } = market();
+    deposit(i1, 5_000_000);
+    const sell = order(i1, { side: "SELL", price: 10_000, quantity: 10 });
+    order(i1, { side: "BUY", price: 10_000, quantity: 10 });
+    assert.equal(db.get("SELECT status, cancel_reason FROM orders WHERE id = ?", sell.id).cancel_reason, "SELF_TRADE_PREVENTION");
+    assert.equal(db.get("SELECT COUNT(*) AS n FROM trades").n, 0n);
+  });
+
+  it("tạm ngừng giao dịch hủy toàn bộ lệnh, hoàn tiền & token; cảnh báo giá kích hoạt", () => {
+    const { order, deposit, cashOf, hold, i1, i2, ex, asset, L, adminId, db } = market();
+    deposit(i2, 5_000_000);
+    ex.createAlert(i2, asset, "BELOW", 9_900);
+    order(i1, { side: "SELL", price: 9_900, quantity: 10 });
+    order(i2, { side: "BUY", price: 9_900, quantity: 10 });
+    assert.ok(db.get("SELECT 1 FROM notifications WHERE user_id = ? AND title LIKE 'Cảnh báo giá%'", i2));
+    order(i1, { side: "SELL", price: 10_500, quantity: 500 });
+    order(i2, { side: "BUY", price: 9_500, quantity: 100 });
+    L.triggerPlanningHalt(adminId, asset, "https://example.gov.vn/tb.pdf");
     assert.equal(hold(i1, asset).locked_tokens, 0n);
-    assert.equal(hold(i1, asset).available_tokens, 20_000n);
-    assert.throws(() => L.createOtcOrder(i2, listing, 1), /không còn hiệu lực/);
+    assert.equal(cashOf(i2).locked, 0n);
+    assert.throws(() => order(i1, { side: "SELL", price: 10_000, quantity: 1 }), { code: "NOT_TRADING" });
+    assert.ok(L.checkInvariants(asset).ok);
+  });
+
+  it("bảo toàn tiền: tổng nạp = số dư + phí + thuế", () => {
+    const { order, deposit, i1, i2, db } = market();
+    deposit(i1, 3_000_000);
+    deposit(i2, 7_000_000);
+    order(i1, { side: "SELL", price: 10_300, quantity: 77 });
+    order(i2, { side: "BUY", price: 10_400, quantity: 123 });
+    order(i1, { side: "SELL", price: 10_000, quantity: 99 });
+    const bal = db.get("SELECT SUM(available + locked) AS s FROM cash_accounts").s;
+    const fees = db.get("SELECT SUM(buyer_fee + seller_fee + seller_tax) AS s FROM trades").s;
+    assert.equal(bal + fees, 10_000_000n);
   });
 });
 

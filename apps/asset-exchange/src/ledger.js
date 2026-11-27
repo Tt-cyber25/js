@@ -4,6 +4,7 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import { ASSET_TYPES, isAssetType } from "./assetTypes.js";
 import { HttpError, hashPassword, verifyPassword } from "./auth.js";
+import { createExchange } from "./exchange.js";
 
 const BPS = 10000n;
 
@@ -130,6 +131,17 @@ export function createLedger(db, config) {
       userId,
       assetId,
     );
+  const ex = createExchange(db, config, {
+    requireKyc,
+    toBig,
+    getAsset,
+    holding,
+    hasActiveVote,
+    creditBuyer,
+    newBatch,
+    payoutTx,
+    paymentInstructions: (t) => paymentInstructions(t),
+  });
 
   // ---------- người dùng & eKYC ----------
   function registerUser(input) {
@@ -325,7 +337,17 @@ export function createLedger(db, config) {
     };
   }
 
-  function createPrimaryOrder(userId, assetId, tokenAmount) {
+  // Ghi nhận giao dịch mua sơ cấp đã thanh toán (gọi bên trong tx)
+  function completePrimary(t) {
+    const a = getAsset(t.asset_id);
+    db.run("UPDATE assets SET reserved_tokens = reserved_tokens - ?, sold_tokens = sold_tokens + ? WHERE id = ?", t.token_amount, t.token_amount, a.id);
+    db.run("UPDATE user_holdings SET available_tokens = available_tokens - ? WHERE user_id = ? AND asset_id = ?", t.token_amount, a.owner_id, a.id);
+    // Token bị khóa cho tới khi đạt Soft Cap & tài sản sang tên SPV (Admin kích hoạt)
+    creditBuyer(t.user_id, a.id, t.token_amount, a.token_price, { locked: true });
+    db.notify(t.user_id, "Đã nhận thanh toán", `${t.token_amount} token ${a.asset_code} đang chờ hoàn tất gọi vốn.`);
+  }
+
+  function createPrimaryOrder(userId, assetId, tokenAmount, { fromWallet = false } = {}) {
     requireKyc(userId);
     const qty = toBig(tokenAmount, "số lượng token");
     return db.tx(() => {
@@ -349,98 +371,15 @@ export function createLedger(db, config) {
         fiat,
         `+${config.orderTtlMinutes} minutes`,
       );
-      db.audit(userId, "ORDER_CREATED", "transactions", id, { type: "BUY_PRIMARY", qty, fiat });
-      return paymentInstructions(db.get("SELECT * FROM transactions WHERE id = ?", id));
-    });
-  }
-
-  // ---------- Thị trường thứ cấp OTC ----------
-  function createOtcListing(userId, assetId, tokenAmount, pricePerToken) {
-    requireKyc(userId);
-    const qty = toBig(tokenAmount, "số lượng token");
-    const price = toBig(pricePerToken, "giá chào bán", { min: 1000n });
-    return db.tx(() => {
-      const a = getAsset(assetId);
-      if (a.status !== "ACTIVE") throw new HttpError(409, "Tài sản đang không cho phép giao dịch thứ cấp");
-      if (hasActiveVote(userId, assetId)) {
-        throw new HttpError(409, "Token đã dùng để biểu quyết bị khóa chuyển nhượng đến khi kết thúc biểu quyết");
+      db.audit(userId, "ORDER_CREATED", "transactions", id, { type: "BUY_PRIMARY", qty, fiat, fromWallet });
+      if (fromWallet) {
+        // Thanh toán ngay bằng số dư ví (tiền đã nằm trong tài khoản phong tỏa)
+        ex.debitCash(userId, fiat);
+        const t = db.get("SELECT * FROM transactions WHERE id = ?", id);
+        completePrimary(t);
+        db.run("UPDATE transactions SET status = 'COMPLETED', bank_txn_id = 'WALLET', completed_at = datetime('now') WHERE id = ?", id);
+        return { transaction_id: id, reference_code: t.reference_code, amount: fiat, paid_from_wallet: true };
       }
-      const h = holding(userId, assetId);
-      if (h.available_tokens < qty) throw new HttpError(409, "Không đủ token khả dụng");
-      db.run(
-        "UPDATE user_holdings SET available_tokens = available_tokens - ?, locked_tokens = locked_tokens + ? WHERE id = ?",
-        qty,
-        qty,
-        h.id,
-      );
-      const id = randomUUID();
-      db.run(
-        "INSERT INTO otc_listings (id, asset_id, seller_id, token_amount, remaining_tokens, price_per_token) VALUES (?,?,?,?,?,?)",
-        id,
-        assetId,
-        userId,
-        qty,
-        qty,
-        price,
-      );
-      db.audit(userId, "OTC_LISTED", "otc_listings", id, { assetId, qty, price });
-      return id;
-    });
-  }
-
-  function releaseListing(listing) {
-    const free = listing.remaining_tokens - listing.reserved_tokens;
-    db.run(
-      "UPDATE user_holdings SET locked_tokens = locked_tokens - ?, available_tokens = available_tokens + ? WHERE user_id = ? AND asset_id = ?",
-      free,
-      free,
-      listing.seller_id,
-      listing.asset_id,
-    );
-    db.run(
-      // Phần đang được giữ chỗ cho đơn chờ thanh toán vẫn có thể khớp; hết hạn thì trả về người bán
-      "UPDATE otc_listings SET remaining_tokens = reserved_tokens, status = 'CANCELLED' WHERE id = ?",
-      listing.id,
-    );
-  }
-
-  function cancelListing(userId, listingId) {
-    return db.tx(() => {
-      const l = db.get("SELECT * FROM otc_listings WHERE id = ?", listingId);
-      if (!l || l.seller_id !== userId) throw new HttpError(404, "Không tìm thấy lệnh bán");
-      if (l.status !== "OPEN") throw new HttpError(409, "Lệnh bán đã đóng");
-      releaseListing(l);
-      db.audit(userId, "OTC_CANCELLED", "otc_listings", listingId, {});
-    });
-  }
-
-  function createOtcOrder(userId, listingId, tokenAmount) {
-    requireKyc(userId);
-    const qty = toBig(tokenAmount, "số lượng token");
-    return db.tx(() => {
-      const l = db.get("SELECT * FROM otc_listings WHERE id = ?", listingId);
-      if (!l || l.status !== "OPEN") throw new HttpError(404, "Lệnh bán không còn hiệu lực");
-      if (l.seller_id === userId) throw new HttpError(400, "Không thể tự mua lệnh của chính mình");
-      const a = getAsset(l.asset_id);
-      if (a.status !== "ACTIVE") throw new HttpError(409, "Tài sản đang tạm ngừng giao dịch");
-      if (qty > l.remaining_tokens - l.reserved_tokens) throw new HttpError(409, "Lệnh bán không đủ số lượng");
-      db.run("UPDATE otc_listings SET reserved_tokens = reserved_tokens + ? WHERE id = ?", qty, listingId);
-      const id = randomUUID();
-      const fiat = qty * l.price_per_token;
-      db.run(
-        `INSERT INTO transactions (id, reference_code, user_id, asset_id, type, token_amount, fiat_amount, net_amount, listing_id, expires_at)
-         VALUES (?,?,?,?,'BUY_OTC',?,?,?,?, datetime('now', ?))`,
-        id,
-        refCode("OTC"),
-        userId,
-        l.asset_id,
-        qty,
-        fiat,
-        fiat,
-        listingId,
-        `+${config.orderTtlMinutes} minutes`,
-      );
-      db.audit(userId, "ORDER_CREATED", "transactions", id, { type: "BUY_OTC", qty, fiat, listingId });
       return paymentInstructions(db.get("SELECT * FROM transactions WHERE id = ?", id));
     });
   }
@@ -449,25 +388,6 @@ export function createLedger(db, config) {
   function releaseOrder(tx, newStatus) {
     if (tx.type === "BUY_PRIMARY") {
       db.run("UPDATE assets SET reserved_tokens = reserved_tokens - ? WHERE id = ?", tx.token_amount, tx.asset_id);
-    } else if (tx.type === "BUY_OTC") {
-      const l = db.get("SELECT * FROM otc_listings WHERE id = ?", tx.listing_id);
-      db.run("UPDATE otc_listings SET reserved_tokens = reserved_tokens - ? WHERE id = ?", tx.token_amount, l.id);
-      if (l.status !== "OPEN") {
-        // Lệnh bán đã bị hủy / tạm ngừng: trả token về cho người bán
-        db.run(
-          "UPDATE otc_listings SET remaining_tokens = remaining_tokens - ?, status = CASE WHEN remaining_tokens - ? = 0 THEN 'CANCELLED' ELSE status END WHERE id = ?",
-          tx.token_amount,
-          tx.token_amount,
-          l.id,
-        );
-        db.run(
-          "UPDATE user_holdings SET locked_tokens = locked_tokens - ?, available_tokens = available_tokens + ? WHERE user_id = ? AND asset_id = ?",
-          tx.token_amount,
-          tx.token_amount,
-          l.seller_id,
-          l.asset_id,
-        );
-      }
     }
     db.run("UPDATE transactions SET status = ? WHERE id = ?", newStatus, tx.id);
   }
@@ -508,6 +428,20 @@ export function createLedger(db, config) {
       }
       // Lũy đẳng: ngân hàng gửi lại webhook nhiều lần không được cộng trùng token
       if (t.status === "COMPLETED") return { ok: true, status: 200, result: "DUPLICATE_IGNORED" };
+      // Nạp tiền: luôn ghi có đúng số tiền thực nhận vào ví (kể cả khi yêu cầu nạp đã hết hạn)
+      if (t.type === "DEPOSIT") {
+        ex.creditCash(t.user_id, amount);
+        db.run(
+          "UPDATE transactions SET status = 'COMPLETED', fiat_amount = ?, net_amount = ?, bank_txn_id = ?, completed_at = datetime('now') WHERE id = ?",
+          amount,
+          amount,
+          bankTxnId,
+          t.id,
+        );
+        db.notify(t.user_id, "Nạp tiền thành công", `Đã cộng ${amount} VND vào ví.`);
+        db.audit(null, "DEPOSIT_CONFIRMED", "transactions", t.id, { ref, amount, bankTxnId });
+        return { ok: true, status: 200, result: "COMPLETED" };
+      }
       if (t.status !== "PENDING") {
         // Tiền về muộn cho đơn đã hết hạn/hủy → lập lệnh hoàn tiền chờ Admin duyệt
         const batchId = newBatch(t.asset_id, "REFUND", [amount], null);
@@ -522,55 +456,7 @@ export function createLedger(db, config) {
       }
 
       if (t.type === "BUY_PRIMARY") {
-        const a = getAsset(t.asset_id);
-        db.run(
-          "UPDATE assets SET reserved_tokens = reserved_tokens - ?, sold_tokens = sold_tokens + ? WHERE id = ?",
-          t.token_amount,
-          t.token_amount,
-          a.id,
-        );
-        db.run(
-          "UPDATE user_holdings SET available_tokens = available_tokens - ? WHERE user_id = ? AND asset_id = ?",
-          t.token_amount,
-          a.owner_id,
-          a.id,
-        );
-        // Token bị khóa cho tới khi đạt Soft Cap & tài sản sang tên SPV (Admin kích hoạt)
-        creditBuyer(t.user_id, a.id, t.token_amount, a.token_price, { locked: true });
-        db.notify(t.user_id, "Đã nhận thanh toán", `${t.token_amount} token ${a.asset_code} đang chờ hoàn tất gọi vốn.`);
-      } else if (t.type === "BUY_OTC") {
-        const l = db.get("SELECT * FROM otc_listings WHERE id = ?", t.listing_id);
-        db.run(
-          `UPDATE otc_listings SET reserved_tokens = reserved_tokens - ?, remaining_tokens = remaining_tokens - ?,
-                  status = CASE WHEN remaining_tokens - ? = 0 THEN 'FILLED' ELSE status END WHERE id = ?`,
-          t.token_amount,
-          t.token_amount,
-          t.token_amount,
-          l.id,
-        );
-        db.run(
-          "UPDATE user_holdings SET locked_tokens = locked_tokens - ? WHERE user_id = ? AND asset_id = ?",
-          t.token_amount,
-          l.seller_id,
-          l.asset_id,
-        );
-        creditBuyer(t.user_id, l.asset_id, t.token_amount, l.price_per_token, { locked: false });
-        const fee = (t.fiat_amount * config.otcFeeBps) / BPS;
-        const batchId = newBatch(l.asset_id, "OTC", [t.fiat_amount - fee], null);
-        payoutTx({
-          userId: l.seller_id,
-          assetId: l.asset_id,
-          type: "SELL_OTC",
-          tokens: t.token_amount,
-          gross: t.fiat_amount,
-          fee,
-          net: t.fiat_amount - fee,
-          batchId,
-          note: `Khớp lệnh ${t.reference_code}`,
-        });
-        db.run("INSERT INTO price_history (asset_id, price) VALUES (?,?)", l.asset_id, l.price_per_token);
-        db.notify(l.seller_id, "Lệnh bán đã khớp", `Đã bán ${t.token_amount} token, tiền đang chờ giải ngân.`);
-        db.notify(t.user_id, "Mua thành công", `Đã nhận ${t.token_amount} token.`);
+        completePrimary(t);
       }
       db.run(
         "UPDATE transactions SET status = 'COMPLETED', bank_txn_id = ?, completed_at = datetime('now') WHERE id = ?",
@@ -633,7 +519,8 @@ export function createLedger(db, config) {
         releaseOrder(t, "CANCELLED");
       }
       const paid = db.all("SELECT * FROM transactions WHERE asset_id = ? AND status = 'COMPLETED' AND type = 'BUY_PRIMARY'", assetId);
-      const batchId = paid.length ? newBatch(assetId, "REFUND", paid.map((t) => t.fiat_amount), adminId) : null;
+      const bankPaid = paid.filter((t) => t.bank_txn_id !== "WALLET");
+      const batchId = bankPaid.length ? newBatch(assetId, "REFUND", bankPaid.map((t) => t.fiat_amount), adminId) : null;
       for (const t of paid) {
         db.run(
           "UPDATE user_holdings SET locked_tokens = locked_tokens - ? WHERE user_id = ? AND asset_id = ?",
@@ -642,7 +529,8 @@ export function createLedger(db, config) {
           assetId,
         );
         db.run("UPDATE transactions SET status = 'REFUNDED' WHERE id = ?", t.id);
-        payoutTx({ userId: t.user_id, assetId, type: "REFUND", tokens: t.token_amount, gross: t.fiat_amount, net: t.fiat_amount, batchId, note: `Hoàn tiền ${t.reference_code}` });
+        if (t.bank_txn_id === "WALLET") ex.creditCash(t.user_id, t.fiat_amount);
+        else payoutTx({ userId: t.user_id, assetId, type: "REFUND", tokens: t.token_amount, gross: t.fiat_amount, net: t.fiat_amount, batchId, note: `Hoàn tiền ${t.reference_code}` });
         db.notify(t.user_id, "Gọi vốn không thành công", `${a.asset_code} không đạt Soft Cap, tiền sẽ được hoàn 100%.`, "WARNING");
       }
       db.run("UPDATE user_holdings SET available_tokens = ? WHERE user_id = ? AND asset_id = ?", a.total_tokens, a.owner_id, assetId);
@@ -876,9 +764,7 @@ export function createLedger(db, config) {
     for (const l of pay) {
       payoutTx({ userId: l.user_id, assetId: a.id, type: txType, tokens: l.tokens, gross: l.amount, net: l.amount, batchId, note: extra.note });
     }
-    for (const l of db.all("SELECT * FROM otc_listings WHERE asset_id = ? AND status = 'OPEN'", a.id)) {
-      db.run("UPDATE otc_listings SET status = 'CANCELLED' WHERE id = ?", l.id);
-    }
+    ex.cancelAllForAsset(a.id, "DELISTED");
     for (const t of db.all("SELECT * FROM transactions WHERE asset_id = ? AND status = 'PENDING'", a.id)) {
       db.run("UPDATE transactions SET status = 'CANCELLED' WHERE id = ?", t.id);
     }
@@ -929,11 +815,9 @@ export function createLedger(db, config) {
     return db.tx(() => {
       const a = getAsset(assetId);
       if (a.status !== "ACTIVE" && a.status !== "FUNDING") throw new HttpError(409, "Tài sản không ở trạng thái giao dịch");
-      // 1) Hủy mọi lệnh bán đang mở (trả phần chưa giữ chỗ về người bán)
-      for (const l of db.all("SELECT * FROM otc_listings WHERE asset_id = ? AND status = 'OPEN'", assetId)) {
-        releaseListing(l);
-      }
-      // 2) Hủy mọi đơn chờ thanh toán (trả phần giữ chỗ về người bán / kho sơ cấp)
+      // 1) Hủy toàn bộ lệnh trên sổ lệnh (hoàn tiền/token phong tỏa)
+      ex.cancelAllForAsset(assetId, "HALT");
+      // 2) Hủy mọi đơn mua sơ cấp chờ thanh toán
       for (const t of db.all("SELECT * FROM transactions WHERE asset_id = ? AND status = 'PENDING'", assetId)) {
         releaseOrder(t, "CANCELLED");
       }
@@ -1007,9 +891,6 @@ export function createLedger(db, config) {
     rejectAsset,
     paymentInstructions,
     createPrimaryOrder,
-    createOtcListing,
-    cancelListing,
-    createOtcOrder,
     cancelOrder,
     expireStaleOrders,
     handleBankPayment,
@@ -1030,5 +911,6 @@ export function createLedger(db, config) {
     batchCsv,
     checkInvariants,
     holders,
+    exchange: ex,
   };
 }

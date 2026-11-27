@@ -2,7 +2,7 @@
 // An toàn: mọi dữ liệu động đều đi qua esc() trước khi chèn HTML; không dùng inline script/handler (CSP).
 
 const $app = document.getElementById("app");
-const state = { token: localStorage.getItem("tvn_token"), me: null, meta: null, unread: 0, poll: null };
+const state = { token: localStorage.getItem("tvn_token"), me: null, meta: null, unread: 0, poll: null, onMarket: null, es: null };
 
 // ---------- tiện ích ----------
 const esc = (v) =>
@@ -31,12 +31,12 @@ const STATUS = {
 };
 const TX = {
   BUY_PRIMARY: "Mua sơ cấp",
-  BUY_OTC: "Mua OTC",
-  SELL_OTC: "Bán OTC",
   DIVIDEND: "Cổ tức",
   REFUND: "Hoàn tiền",
   EXIT_PAYOUT: "Tất toán",
   OWNER_DISBURSEMENT: "Giải ngân chủ TS",
+  DEPOSIT: "Nạp tiền",
+  WITHDRAWAL: "Rút tiền",
   RENT_PAYMENT: "Tiền thuê",
 };
 const TXST = {
@@ -124,23 +124,37 @@ const needLogin = () =>
 function navBar() {
   const r = location.hash || "#/";
   const items = [
-    ["#/", "🏛️", "Thị trường"],
-    ["#/portfolio", "💼", "Danh mục"],
-    ["#/notifications", "🔔", "Thông báo"],
+    ["#/board", "📊", "Bảng giá", (x) => x === "#/" || x.startsWith("#/board")],
+    ["#/market", "🏛️", "Gọi vốn", (x) => x.startsWith("#/market") || x.startsWith("#/asset")],
+    ["#/trade", "⚡", "Giao dịch", (x) => x.startsWith("#/trade")],
+    ["#/portfolio", "💼", "Tài sản", (x) => x.startsWith("#/portfolio") || x.startsWith("#/pay")],
   ];
-  if (state.me && (state.me.role === "OWNER" || state.me.role === "ADMIN")) items.push(["#/list-asset", "➕", "Niêm yết"]);
-  if (state.me?.role === "ADMIN") items.push(["#/admin", "🛡️", "Quản trị"]);
-  items.push(["#/account", "👤", "Tài khoản"]);
+  if (state.me?.role === "ADMIN") items.push(["#/admin", "🛡️", "Quản trị", (x) => x.startsWith("#/admin")]);
+  items.push(["#/account", "👤", "Tài khoản", (x) => x.startsWith("#/account") || x.startsWith("#/list-asset")]);
   document.getElementById("bottomnav").innerHTML = items
-    .map(([h, ic, l]) => {
-      const active = h === "#/" ? r === "#/" || r.startsWith("#/asset") : r.startsWith(h);
-      const badge = h === "#/notifications" && state.unread > 0 ? `<span class="badge">${esc(state.unread)}</span>` : "";
-      return `<a href="${h}" class="${active ? "active" : ""}"><span class="ic">${ic}</span>${l}${badge}</a>`;
-    })
+    .map(([h, ic, l, test]) => `<a href="${h}" class="${test(r) ? "active" : ""}"><span class="ic">${ic}</span>${l}</a>`)
     .join("");
+  const bell = `<a class="bell" href="#/notifications" aria-label="Thông báo">🔔${state.unread > 0 ? `<span class="badge">${esc(state.unread)}</span>` : ""}</a>`;
   document.getElementById("topbar-right").innerHTML = state.me
-    ? `<span class="pill">${esc(state.me.full_name)} · ${esc(state.me.role)}</span>`
+    ? `<div class="row">${bell}<span class="pill">${esc(state.me.full_name)}</span></div>`
     : `<a class="btn sm gold" href="#/account">Đăng nhập</a>`;
+}
+
+// Luồng giá thời gian thực (SSE): báo mã nào vừa có thay đổi để màn hình đang mở tự cập nhật
+function startStream() {
+  if (state.es || !window.EventSource) return;
+  state.es = new EventSource("/api/stream");
+  let timer;
+  const pendingIds = new Set();
+  state.es.addEventListener("market", (e) => {
+    for (const id of JSON.parse(e.data)) pendingIds.add(id);
+    clearTimeout(timer);
+    timer = setTimeout(() => {
+      const ids = [...pendingIds];
+      pendingIds.clear();
+      state.onMarket?.(ids);
+    }, 120);
+  });
 }
 
 async function refreshMe() {
@@ -159,6 +173,7 @@ async function refreshMe() {
 
 async function router() {
   clearInterval(state.poll);
+  state.onMarket = null;
   document.body.classList.remove("has-buybar");
   closeModal();
   const [pathPart, qs = ""] = location.hash.replace(/^#\/?/, "").split("?");
@@ -166,7 +181,9 @@ async function router() {
   const arg = rest.map(decodeURIComponent);
   navBar();
   try {
-    if (path === "" || path === "market") await viewMarket(new URLSearchParams(qs));
+    if (path === "" || path === "board") await viewBoard(new URLSearchParams(qs));
+    else if (path === "market") await viewMarket(new URLSearchParams(qs));
+    else if (path === "trade") await viewTrade(arg[0]);
     else if (path === "asset") await viewAsset(arg[0], arg[1] || "overview");
     else if (path === "pay") await viewPay(arg[0]);
     else if (path === "portfolio") await viewPortfolio();
@@ -220,7 +237,7 @@ async function viewMarket(qs) {
       <form data-form="search" class="row"><input name="q" placeholder="Tìm theo tên, mã, địa điểm…" value="${esc(q)}" /><button class="btn">Tìm</button></form>
     </section>
     <div class="chips">
-      <a class="chip ${type ? "" : "active"}" href="#/">Tất cả</a>
+      <a class="chip ${type ? "" : "active"}" href="#/market">Tất cả</a>
       ${types.map(([k, t]) => `<a class="chip ${type === k ? "active" : ""}" href="#/market?type=${k}">${t.icon} ${esc(t.label)}</a>`).join("")}
     </div>
     <div class="grid three">${list.map(assetCard).join("") || '<div class="card muted">Chưa có tài sản phù hợp.</div>'}</div>`);
@@ -274,7 +291,7 @@ async function viewAsset(id, tab) {
     ["overview", "Tổng quan & Dòng tiền"],
     ["legal", "Pháp lý & Hồ sơ"],
     ["governance", "Quản trị & Đề xuất"],
-    ["market", "Giao dịch OTC"],
+    ["market", "Thị trường"],
   ];
   let body = "";
   if (tab === "overview") {
@@ -297,7 +314,7 @@ async function viewAsset(id, tab) {
           ${
             mine > 0n
               ? `<div class="notice info">Bạn đang nắm <b>${num(mine)}</b> token (${ratio(mine, a.total_tokens)}%)${big(h.locked_tokens) > 0n ? ` · ${num(h.locked_tokens)} đang khóa` : ""}.</div>
-                 <div class="row"><a class="btn sm ghost" href="#/cert/${esc(a.id)}">Giấy xác nhận sở hữu</a>${a.status === "ACTIVE" ? `<button class="btn sm" data-action="sell" data-asset="${esc(a.id)}" data-max="${esc(h.available_tokens)}" data-price="${esc(a.last_price)}">Đặt bán OTC</button>` : ""}</div>`
+                 <div class="row"><a class="btn sm ghost" href="#/cert/${esc(a.id)}">Giấy xác nhận sở hữu</a>${a.status === "ACTIVE" ? `<a class="btn sm" href="#/trade/${esc(a.id)}">Mua / Bán</a>` : ""}</div>`
               : ""
           }
         </div>
@@ -349,17 +366,16 @@ async function viewAsset(id, tab) {
           : ""
       }`;
   } else if (tab === "market") {
-    body = `
-      <div class="card"><h3>Sổ lệnh bán OTC</h3>
-        ${a.status !== "ACTIVE" ? `<div class="notice">Giao dịch thứ cấp chỉ mở khi tài sản ở trạng thái “Đang vận hành”.</div>` : ""}
-        ${
-          a.listings.length
-            ? `<table><tr><th class="num">Giá/token</th><th class="num">Khả dụng</th><th></th></tr>
-              ${a.listings.map((l) => `<tr><td class="num">${vnd(l.price_per_token)}</td><td class="num">${num(l.available)}</td><td class="num">${Number(l.mine) ? '<span class="muted small">Lệnh của bạn</span>' : `<button class="btn sm" data-action="buy-otc" data-id="${esc(l.id)}" data-max="${esc(l.available)}" data-price="${esc(l.price_per_token)}">Mua</button>`}</td></tr>`).join("")}</table>`
-            : '<p class="muted small">Chưa có lệnh bán.</p>'
-        }
-        <p class="small muted">Phí giao dịch OTC ${pct(state.meta.fees.otc_fee_bps)} (trừ vào tiền bên bán). Tiền mua đi thẳng vào tài khoản phong tỏa; token chỉ chuyển khi ngân hàng xác nhận.</p>
-      </div>`;
+    const m = a.market;
+    body = m
+      ? `<div class="card"><h3>Thông tin giao dịch hôm nay</h3>
+          <div class="kv"><span>Giá khớp gần nhất</span><b class="${pcls(m.last, m)}">${num(m.last)}</b></div>
+          <div class="kv"><span>Tham chiếu / Trần / Sàn</span><b><span class="c-ref">${num(m.ref)}</span> / <span class="c-ceil">${num(m.ceiling)}</span> / <span class="c-floor">${num(m.floor)}</span></b></div>
+          <div class="kv"><span>Cao / Thấp</span><b>${m.high ? num(m.high) : "—"} / ${m.low ? num(m.low) : "—"}</b></div>
+          <div class="kv"><span>Khối lượng / Giá trị</span><b>${num(m.volume)} / ${vnd(m.value)}</b></div>
+          <div class="kv"><span>Vốn hóa</span><b>${vnd(m.market_cap)}</b></div>
+          <a class="btn gold block" href="#/trade/${esc(a.id)}">Mở màn hình giao dịch</a></div>`
+      : `<div class="card notice">Tài sản chỉ được giao dịch trên sàn sau khi hoàn tất gọi vốn và sang tên SPV.</div>`;
   }
 
   let buybar = "";
@@ -368,7 +384,7 @@ async function viewAsset(id, tab) {
       <button class="btn gold" data-action="buy-primary" ${remaining > 0n ? "" : "disabled"}>Mua suất đầu tư</button></div>`;
   } else if (a.status === "ACTIVE") {
     buybar = `<div class="buybar"><div><div class="small muted">Giá gần nhất</div><div class="price">${vnd(a.last_price)}</div></div>
-      <a class="btn gold" href="#/asset/${esc(a.id)}/market">Giao dịch OTC</a></div>`;
+      <a class="btn gold" href="#/trade/${esc(a.id)}">⚡ Giao dịch</a></div>`;
   }
   if (buybar) document.body.classList.add("has-buybar");
 
@@ -381,12 +397,13 @@ async function viewAsset(id, tab) {
     ${body}${buybar}`);
 }
 
-function qtyModal({ title, max, price, action, extra = "" }) {
+function qtyModal({ title, max, price, action, extra = "", wallet = false }) {
   openModal(`<h2>${esc(title)}</h2>
     <form data-form="${action}">${extra}
       <div class="field"><label>Số lượng token (tối đa ${num(max)})</label><input name="qty" type="number" min="1" max="${esc(max)}" step="1" value="${big(max) < 100n ? esc(max) : "100"}" required data-price="${esc(price)}" /></div>
       <div class="kv"><span>Đơn giá</span><b>${vnd(price)}</b></div>
       <div class="kv"><span>Thành tiền</span><b id="qty-total">—</b></div>
+      ${wallet ? '<div class="field"><label class="checkbox"><input type="checkbox" name="from_wallet" /> Thanh toán ngay bằng số dư ví</label></div>' : ""}
       <p class="small muted">Sau khi xác nhận, hệ thống cấp mã VietQR định danh. Tiền chuyển thẳng vào tài khoản phong tỏa tại ngân hàng đối tác — nền tảng không giữ tiền hộ.</p>
       <div class="row"><button class="btn gold">Xác nhận & lấy mã QR</button><button type="button" class="btn ghost" data-action="close">Hủy</button></div>
     </form>`);
@@ -406,8 +423,8 @@ async function viewPay(txId) {
     const p = o.payment;
     render(`<div class="card">
       <h1>${o.status === "COMPLETED" ? "✅ Thanh toán thành công" : o.status === "PENDING" ? "Quét mã để thanh toán" : `Đơn ${esc(TXST[o.status] || o.status)}`}</h1>
-      <div class="small muted">${esc(TX[o.type])} · ${esc(o.asset.asset_code)} – ${esc(o.asset.title)}</div>
-      <div class="kv"><span>Số token</span><b>${num(o.token_amount)}</b></div>
+      <div class="small muted">${esc(TX[o.type])}${o.asset ? ` · ${esc(o.asset.asset_code)} – ${esc(o.asset.title)}` : " vào ví giao dịch"}</div>
+      ${o.asset ? `<div class="kv"><span>Số token</span><b>${num(o.token_amount)}</b></div>` : ""}
       <div class="kv"><span>Số tiền</span><b>${vnd(o.fiat_amount)}</b></div>
       ${
         p
@@ -421,9 +438,9 @@ async function viewPay(txId) {
              <div class="row">
                ${state.meta.allow_bank_simulator ? `<button class="btn" data-action="simulate" data-id="${esc(o.id)}">🧪 Mô phỏng ngân hàng báo có (demo)</button>` : ""}
                <button class="btn ghost" data-action="cancel-order" data-id="${esc(o.id)}">Hủy đơn</button></div>`
-          : `<p>${o.status === "COMPLETED" ? (o.type === "BUY_PRIMARY" ? "Token đã ghi nhận vào danh mục ở trạng thái <b>chờ hoàn tất gọi vốn</b>; sẽ mở khóa khi tài sản sang tên SPV." : "Token đã chuyển vào danh mục của bạn.") : ""}</p>`
+          : `<p>${o.status === "COMPLETED" && o.type === "DEPOSIT" ? "Tiền đã được cộng vào ví, bạn có thể đặt lệnh ngay." : ""}${o.status === "COMPLETED" && o.type !== "DEPOSIT" ? (o.type === "BUY_PRIMARY" ? "Token đã ghi nhận vào danh mục ở trạng thái <b>chờ hoàn tất gọi vốn</b>; sẽ mở khóa khi tài sản sang tên SPV." : "Token đã chuyển vào danh mục của bạn.") : ""}</p>`
       }
-      <div class="row"><a class="btn ghost" href="#/asset/${esc(o.asset.id)}">Về tài sản</a><a class="btn ghost" href="#/portfolio">Danh mục</a></div></div>`);
+      <div class="row">${o.asset ? `<a class="btn ghost" href="#/asset/${esc(o.asset.id)}">Về tài sản</a>` : '<a class="btn ghost" href="#/board">Bảng giá</a>'}<a class="btn ghost" href="#/portfolio">Tài sản của tôi</a></div></div>`);
     const qr = $app.querySelector("img.qr");
     qr?.addEventListener("error", () => {
       qr.replaceWith(Object.assign(document.createElement("div"), {
@@ -441,36 +458,313 @@ async function viewPay(txId) {
 async function viewPortfolio() {
   if (!state.me) return needLogin();
   const p = await api("/api/portfolio");
+  const w = p.wallet;
+  const pnl = big(p.securities_value) - big(p.cost_total);
   render(`
-    <div class="card"><div class="small muted">Tổng tài sản ròng (theo giá gần nhất)</div><div class="big">${vnd(p.net_worth)}</div>
-      <div class="small">Cổ tức đã nhận (sau thuế): <b class="up">${vnd(p.dividends_total)}</b></div></div>
-    <h2>Tài sản đang nắm giữ</h2>
+    <div class="card nav-card">
+      <div class="small muted">Tổng tài sản ròng (NAV)</div><div class="big">${vnd(p.net_worth)}</div>
+      <div class="grid two-col small">
+        <div><div class="muted">Tiền khả dụng</div><b>${vnd(w.available)}</b></div>
+        <div><div class="muted">Tiền chờ khớp (phong tỏa)</div><b>${vnd(w.locked)}</b></div>
+        <div><div class="muted">Giá trị token</div><b>${vnd(p.securities_value)}</b></div>
+        <div><div class="muted">Lãi/lỗ tạm tính</div><b class="${pnl >= 0n ? "up" : "down"}">${pnl >= 0n ? "+" : ""}${vnd(pnl)}</b></div>
+      </div>
+      <div class="small">Cổ tức đã nhận (sau thuế): <b class="up">${vnd(p.dividends_total)}</b></div>
+      <div class="row"><button class="btn gold" data-action="deposit">＋ Nạp tiền</button><button class="btn ghost" data-action="withdraw" data-max="${esc(w.available)}">Rút tiền</button><a class="btn ghost" href="#/trade">⚡ Giao dịch</a></div>
+    </div>
+    <h2>Danh mục token</h2>
     ${
       p.holdings
         .map((h) => {
           const qty = big(h.available_tokens) + big(h.locked_tokens);
-          const pnl = big(h.market_value) - big(h.cost_basis);
-          return `<div class="card"><div class="row"><a href="#/asset/${esc(h.asset_id)}"><b>${esc(h.asset_code)}</b></a>${pill(h.status)}</div>
-            <div class="small">${esc(h.title)}</div>
-            <div class="kv"><span>Số token</span><b>${num(qty)}${big(h.locked_tokens) > 0n ? ` (khóa ${num(h.locked_tokens)})` : ""}</b></div>
-            <div class="kv"><span>Giá vốn TB / Giá hiện tại</span><b>${vnd(h.avg_buy_price)} / ${vnd(h.last_price)}</b></div>
-            <div class="kv"><span>Giá trị</span><b>${vnd(h.market_value)}</b></div>
-            <div class="kv"><span>Lãi/lỗ tạm tính</span><b class="${pnl >= 0n ? "up" : "down"}">${vnd(pnl)}</b></div>
-            <div class="row"><a class="btn sm ghost" href="#/cert/${esc(h.asset_id)}">📄 Giấy xác nhận sở hữu</a>
-            ${h.status === "ACTIVE" && big(h.available_tokens) > 0n ? `<button class="btn sm" data-action="sell" data-asset="${esc(h.asset_id)}" data-max="${esc(h.available_tokens)}" data-price="${esc(h.last_price)}">Đặt bán OTC</button>` : ""}</div></div>`;
+          const pl = big(h.market_value) - big(h.cost_basis);
+          const plPct = big(h.cost_basis) > 0n ? ratio(pl, h.cost_basis) : 0;
+          return `<div class="card holding"><div class="row between"><a href="#/asset/${esc(h.asset_id)}"><b>${esc(h.asset_code)}</b></a>${pill(h.status)}</div>
+            <div class="small muted">${esc(h.title)}</div>
+            <div class="grid two-col small">
+              <div><div class="muted">Khối lượng</div><b>${num(qty)}</b>${big(h.locked_tokens) > 0n ? `<div class="muted">khóa ${num(h.locked_tokens)}</div>` : ""}</div>
+              <div><div class="muted">Giá vốn / Giá TT</div><b>${num(h.avg_buy_price)} / ${num(h.last_price)}</b></div>
+              <div><div class="muted">Giá trị</div><b>${vnd(h.market_value)}</b></div>
+              <div><div class="muted">Lãi/lỗ</div><b class="${pl >= 0n ? "up" : "down"}">${pl >= 0n ? "+" : ""}${num(pl)} (${plPct}%)</b></div>
+            </div>
+            <div class="row"><a class="btn sm ghost" href="#/cert/${esc(h.asset_id)}">📄 Giấy xác nhận</a>
+            ${h.status === "ACTIVE" ? `<a class="btn sm" href="#/trade/${esc(h.asset_id)}">Mua / Bán</a>` : ""}</div></div>`;
         })
-        .join("") || '<div class="card muted">Bạn chưa sở hữu tài sản nào. <a href="#/">Khám phá thị trường</a></div>'
+        .join("") || '<div class="card muted">Bạn chưa sở hữu token nào. <a href="#/board">Xem bảng giá</a> hoặc <a href="#/market">tham gia gọi vốn</a>.</div>'
     }
-    ${
-      p.listings.length
-        ? `<h2>Lệnh bán đang mở</h2><div class="card"><table><tr><th>Tài sản</th><th class="num">Còn lại</th><th class="num">Giá</th><th></th></tr>
-          ${p.listings.map((l) => `<tr><td>${esc(l.asset_code)}</td><td class="num">${num(l.remaining_tokens)}</td><td class="num">${vnd(l.price_per_token)}</td><td class="num"><button class="btn sm ghost" data-action="cancel-listing" data-id="${esc(l.id)}">Hủy</button></td></tr>`).join("")}</table></div>`
-        : ""
-    }
-    <h2>Lịch sử giao dịch & cổ tức</h2>
-    <div class="card table-wrap"><table><tr><th>Thời gian</th><th>Loại</th><th>TS</th><th class="num">Token</th><th class="num">Thực nhận/chi</th><th>Trạng thái</th></tr>
-      ${p.transactions.map((t) => `<tr><td class="small">${esc(date(t.created_at))}</td><td>${esc(TX[t.type] || t.type)}${t.tax_amount !== "0" ? `<div class="small muted">Thuế ${num(t.tax_amount)}</div>` : ""}</td><td>${esc(t.asset_code)}</td><td class="num">${num(t.token_amount)}</td><td class="num">${num(t.net_amount)}</td><td>${t.status === "PENDING" ? `<a href="#/pay/${esc(t.id)}">${esc(TXST[t.status])}</a>` : esc(TXST[t.status] || t.status)}</td></tr>`).join("") || '<tr><td colspan="6" class="muted">Chưa có giao dịch.</td></tr>'}
+    <h2>Lịch sử tiền & cổ tức</h2>
+    <div class="card table-wrap"><table><tr><th>Thời gian</th><th>Loại</th><th>TS</th><th class="num">Token</th><th class="num">Số tiền</th><th>Trạng thái</th></tr>
+      ${p.transactions.map((t) => `<tr><td class="small">${esc(date(t.created_at))}</td><td>${esc(TX[t.type] || t.type)}${t.tax_amount !== "0" ? `<div class="small muted">Thuế ${num(t.tax_amount)}</div>` : ""}</td><td>${esc(t.asset_code || "Ví")}</td><td class="num">${t.token_amount !== "0" ? num(t.token_amount) : ""}</td><td class="num">${num(t.net_amount)}</td><td>${t.status === "PENDING" ? `<a href="#/pay/${esc(t.id)}">${esc(TXST[t.status])}</a>` : esc(TXST[t.status] || t.status)}</td></tr>`).join("") || '<tr><td colspan="6" class="muted">Chưa có giao dịch.</td></tr>'}
     </table></div>`);
+}
+
+// ---------- BẢNG GIÁ ----------
+const WATCH_KEY = "tvn_watchlist";
+const watchlist = () => new Set(JSON.parse(localStorage.getItem(WATCH_KEY) || "[]"));
+function toggleWatch(id) {
+  const w = watchlist();
+  w.has(id) ? w.delete(id) : w.add(id);
+  localStorage.setItem(WATCH_KEY, JSON.stringify([...w]));
+}
+// Màu giá theo quy ước bảng điện: trần tím, sàn xanh lam, tham chiếu vàng, tăng xanh, giảm đỏ
+function pcls(price, m) {
+  if (price === null || price === undefined) return "";
+  const p = big(price);
+  if (p >= big(m.ceiling)) return "c-ceil";
+  if (p <= big(m.floor)) return "c-floor";
+  if (p === big(m.ref)) return "c-ref";
+  return p > big(m.ref) ? "up" : "down";
+}
+const chg = (m) => `${big(m.change) > 0n ? "+" : ""}${num(m.change)}`;
+const chgPct = (m) => `${big(m.change_bps) > 0n ? "+" : ""}${(Number(m.change_bps) / 100).toFixed(2)}%`;
+
+let boardPrev = new Map();
+async function viewBoard(qs) {
+  const filter = qs.get("f") || "all";
+  const full = localStorage.getItem("tvn_board_full") === "1";
+  const load = async () => {
+    const rows = await api("/api/market/board");
+    const w = watchlist();
+    const list = rows.filter((r) => (filter === "all" ? true : filter === "watch" ? w.has(r.id) : r.asset_type === filter));
+    const up = rows.filter((r) => big(r.change) > 0n).length;
+    const down = rows.filter((r) => big(r.change) < 0n).length;
+    const value = rows.reduce((s, r) => s + big(r.value), 0n);
+    document.getElementById("board-stats").innerHTML = `
+      <div><div class="muted small">Giá trị khớp hôm nay</div><b>${vnd(value)}</b></div>
+      <div><div class="muted small">Tăng / Đứng / Giảm</div><b><span class="up">${up}</span> / <span class="c-ref">${rows.length - up - down}</span> / <span class="down">${down}</span></b></div>`;
+    const lv = (arr, i, m) => (arr[i] ? `<td class="num ${pcls(arr[i].price, m)}">${num(arr[i].price)}</td><td class="num ${pcls(arr[i].price, m)}">${num(arr[i].qty)}</td>` : "<td></td><td></td>");
+    const star = (r) => `<button class="star ${w.has(r.id) ? "on" : ""}" data-action="watch" data-id="${esc(r.id)}" aria-label="Theo dõi">★</button>`;
+    const flash = (r) => {
+      const prev = boardPrev.get(r.id);
+      boardPrev.set(r.id, r.last);
+      if (prev === undefined || prev === r.last) return "";
+      return big(r.last) > big(prev) ? "flash-up" : "flash-down";
+    };
+    const body = list
+      .map((r) => {
+        const f = flash(r);
+        const icon = state.meta.asset_types[r.asset_type]?.icon || "";
+        if (!full) {
+          return `<tr data-href="#/trade/${esc(r.id)}">
+            <td>${star(r)}</td><td><b>${icon} ${esc(r.asset_code)}</b>${r.status === "HALTED_PLANNING" ? ' <span class="pill st-HALTED_PLANNING">Ngừng GD</span>' : ""}<div class="small muted">KL ${num(r.volume)}</div></td>
+            <td class="num ${pcls(r.last, r)} ${f}"><b>${num(r.last)}</b></td>
+            <td class="num"><span class="chgbox ${pcls(r.last, r)}">${chgPct(r)}</span></td></tr>`;
+        }
+        return `<tr data-href="#/trade/${esc(r.id)}"><td>${star(r)}</td><td><b>${esc(r.asset_code)}</b></td>
+          <td class="num c-ceil">${num(r.ceiling)}</td><td class="num c-floor">${num(r.floor)}</td><td class="num c-ref">${num(r.ref)}</td>
+          ${lv(r.bids, 2, r)}${lv(r.bids, 1, r)}${lv(r.bids, 0, r)}
+          <td class="num ${pcls(r.last, r)} ${f}"><b>${num(r.last)}</b></td><td class="num ${pcls(r.last, r)}">${num(r.last_qty)}</td><td class="num ${pcls(r.last, r)}">${chg(r)}</td><td class="num ${pcls(r.last, r)}">${chgPct(r)}</td>
+          ${lv(r.asks, 0, r)}${lv(r.asks, 1, r)}${lv(r.asks, 2, r)}
+          <td class="num">${num(r.volume)}</td><td class="num ${pcls(r.high, r)}">${r.high ? num(r.high) : ""}</td><td class="num ${pcls(r.low, r)}">${r.low ? num(r.low) : ""}</td></tr>`;
+      })
+      .join("");
+    const head = full
+      ? `<tr><th></th><th>Mã</th><th class="num">Trần</th><th class="num">Sàn</th><th class="num">TC</th>
+          <th class="num">Giá 3</th><th class="num">KL 3</th><th class="num">Giá 2</th><th class="num">KL 2</th><th class="num">Giá 1</th><th class="num">KL 1</th>
+          <th class="num">Khớp</th><th class="num">KL</th><th class="num">+/-</th><th class="num">%</th>
+          <th class="num">Giá 1</th><th class="num">KL 1</th><th class="num">Giá 2</th><th class="num">KL 2</th><th class="num">Giá 3</th><th class="num">KL 3</th>
+          <th class="num">Tổng KL</th><th class="num">Cao</th><th class="num">Thấp</th></tr>`
+      : `<tr><th></th><th>Mã / KL</th><th class="num">Giá</th><th class="num">+/- %</th></tr>`;
+    document.getElementById("board").innerHTML = `<table class="board ${full ? "full" : ""}">${head}${body || `<tr><td colspan="24" class="muted">${filter === "watch" ? "Chưa có mã theo dõi — bấm ★ để thêm." : "Chưa có mã giao dịch."}</td></tr>`}</table>`;
+  };
+  const types = Object.entries(state.meta.asset_types);
+  render(`
+    <div class="card board-head"><div class="row between"><h1>Bảng giá</h1><button class="btn sm ghost" data-action="board-mode">${full ? "Chế độ gọn" : "Chế độ đầy đủ"}</button></div>
+      <div class="grid two-col" id="board-stats"></div>
+      <div class="small muted">Giá cập nhật theo thời gian thực. Biên độ ±${pct(state.meta.fees.band_bps)} quanh giá tham chiếu, bước giá ${num(state.meta.fees.tick_size)}đ.</div></div>
+    <div class="chips">
+      <a class="chip ${filter === "all" ? "active" : ""}" href="#/board">Tất cả</a>
+      <a class="chip ${filter === "watch" ? "active" : ""}" href="#/board?f=watch">★ Theo dõi</a>
+      ${types.map(([k, t]) => `<a class="chip ${filter === k ? "active" : ""}" href="#/board?f=${k}">${t.icon} ${esc(t.label)}</a>`).join("")}
+    </div>
+    <div class="card table-wrap flush" id="board"></div>
+    <div class="legend small"><span class="c-ceil">■ Trần</span><span class="c-floor">■ Sàn</span><span class="c-ref">■ Tham chiếu</span><span class="up">■ Tăng</span><span class="down">■ Giảm</span></div>`);
+  await load();
+  state.onMarket = () => load().catch(() => {});
+}
+
+// ---------- MÀN HÌNH GIAO DỊCH ----------
+const ts = { side: "BUY", type: "LIMIT", interval: "1h", tab: "open" };
+
+function candleChart(cs) {
+  if (cs.length < 2) return '<p class="muted small chart-empty">Chưa đủ dữ liệu khớp lệnh trong khung thời gian này.</p>';
+  const W = 600;
+  const H = 260;
+  const VH = 50;
+  const n = cs.length;
+  const hi = Math.max(...cs.map((c) => c.h));
+  const lo = Math.min(...cs.map((c) => c.l));
+  const pad = (hi - lo) * 0.08 || hi * 0.01;
+  const top = hi + pad;
+  const bot = lo - pad;
+  const y = (p) => ((top - p) / (top - bot)) * (H - VH - 10) + 5;
+  const step = W / n;
+  const bw = Math.max(1.5, step * 0.65);
+  const vmax = Math.max(...cs.map((c) => c.v)) || 1;
+  let out = "";
+  cs.forEach((c, i) => {
+    const x = i * step + step / 2;
+    const upC = c.c >= c.o;
+    const cls = upC ? "cu" : "cd";
+    out += `<line class="${cls}" x1="${x}" x2="${x}" y1="${y(c.h)}" y2="${y(c.l)}"/>`;
+    const y1 = y(Math.max(c.o, c.c));
+    const hgt = Math.max(1, Math.abs(y(c.o) - y(c.c)));
+    out += `<rect class="${cls}" x="${x - bw / 2}" y="${y1}" width="${bw}" height="${hgt}"/>`;
+    const vh = (c.v / vmax) * (VH - 6);
+    out += `<rect class="${cls} vol" x="${x - bw / 2}" y="${H - vh}" width="${bw}" height="${vh}"/>`;
+  });
+  // Đường trung bình động MA(7)
+  const ma = cs.map((_c, i) => (i < 6 ? null : cs.slice(i - 6, i + 1).reduce((s, c) => s + c.c, 0) / 7));
+  const pts = ma.map((v, i) => (v === null ? null : `${(i * step + step / 2).toFixed(1)},${y(v).toFixed(1)}`)).filter(Boolean);
+  if (pts.length > 1) out += `<polyline class="ma" points="${pts.join(" ")}"/>`;
+  const last = cs.at(-1);
+  out += `<line class="lastline" x1="0" x2="${W}" y1="${y(last.c)}" y2="${y(last.c)}"/>`;
+  return `<div class="chart-wrap"><svg class="candles" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="Biểu đồ nến">${out}</svg>
+    <div class="axis-r"><span>${num(Math.round(top))}</span><span>${num(Math.round((top + bot) / 2))}</span><span>${num(Math.round(bot))}</span></div></div>
+    <div class="small muted ohlc">O <b>${num(last.o)}</b> H <b>${num(last.h)}</b> L <b>${num(last.l)}</b> C <b>${num(last.c)}</b> · KL ${num(last.v)} · <span class="ma-legend">— MA(7)</span></div>`;
+}
+
+function bookHtml(d, m) {
+  const max = Math.max(1, ...d.asks.map((x) => Number(x.qty)), ...d.bids.map((x) => Number(x.qty)));
+  const row = (l, side) =>
+    `<div class="book-row ${side}" data-action="pick-price" data-price="${esc(l.price)}"><div class="depth" data-w="${(Number(l.qty) / max) * 100}"></div>
+      <span class="${pcls(l.price, m)}">${num(l.price)}</span><span>${num(l.qty)}</span></div>`;
+  const asks = d.asks.slice(0, 8).reverse().map((l) => row(l, "ask")).join("");
+  const bids = d.bids.slice(0, 8).map((l) => row(l, "bid")).join("");
+  return `<div class="book-head small muted"><span>Giá</span><span>KL</span></div>
+    <div class="book-side">${asks || '<div class="small muted center">Chưa có lệnh bán</div>'}</div>
+    <div class="book-mid ${pcls(m.last, m)}">${num(m.last)} <span class="small">${chgPct(m)}</span></div>
+    <div class="book-side">${bids || '<div class="small muted center">Chưa có lệnh mua</div>'}</div>`;
+}
+
+async function viewTrade(id) {
+  const board = await api("/api/market/board");
+  if (!board.length) return render('<div class="card">Chưa có tài sản nào đang giao dịch.</div>');
+  const sel = board.find((b) => b.id === id || b.asset_code === id) || board[0];
+  if (!id) history.replaceState(null, "", `#/trade/${sel.id}`);
+  const assetId = sel.id;
+  const fee = Number(state.meta.fees.trade_fee_bps) / 10000;
+  const tax = Number(state.meta.fees.sell_tax_bps) / 10000;
+  let m = sel;
+  let bal = null;
+
+  render(`
+    <div class="card t-head" id="t-head"></div>
+    <div class="t-grid">
+      <div class="card t-chart">
+        <div class="row between"><div class="seg" id="t-int">${["15m", "1h", "4h", "1d"].map((i) => `<button class="${ts.interval === i ? "on" : ""}" data-action="interval" data-i="${i}">${i === "1d" ? "1D" : i}</button>`).join("")}</div>
+        <a class="small" href="#/asset/${esc(assetId)}">Hồ sơ tài sản →</a></div>
+        <div id="t-chart"></div>
+      </div>
+      <div class="card t-book"><div id="t-book"></div></div>
+      <div class="card t-form">
+        <div class="seg sides"><button data-action="side" data-s="BUY" class="${ts.side === "BUY" ? "on buy" : ""}">Mua</button><button data-action="side" data-s="SELL" class="${ts.side === "SELL" ? "on sell" : ""}">Bán</button></div>
+        <div class="seg types">${[["LIMIT", "LO"], ["MARKET", "MP"], ["STOP_LIMIT", "Dừng"]].map(([k, l]) => `<button data-action="otype" data-t="${k}" class="${ts.type === k ? "on" : ""}">${l}</button>`).join("")}</div>
+        <form data-form="order" id="order-form" autocomplete="off">
+          <div class="field ${ts.type === "STOP_LIMIT" ? "" : "hidden"}"><label>Giá kích hoạt</label><input name="stop_price" inputmode="numeric" /></div>
+          <div class="field ${ts.type === "MARKET" ? "hidden" : ""}"><label>Giá đặt</label>
+            <div class="stepper"><button type="button" data-action="step" data-d="-1">−</button><input name="price" inputmode="numeric" value="${esc(sel.last)}" /><button type="button" data-action="step" data-d="1">+</button></div></div>
+          ${ts.type === "MARKET" ? '<p class="small muted">Lệnh thị trường khớp ngay với giá tốt nhất trên sổ lệnh, phần chưa khớp tự hủy.</p>' : ""}
+          <div class="field"><label>Khối lượng</label><input name="qty" inputmode="numeric" placeholder="0" /></div>
+          <div class="seg pcts">${[25, 50, 75, 100].map((x) => `<button type="button" data-action="pct" data-p="${x}">${x}%</button>`).join("")}</div>
+          <div class="small" id="t-sum"></div>
+          ${state.me ? `<button class="btn block ${ts.side === "BUY" ? "buy" : "sell"}">${ts.side === "BUY" ? "Đặt MUA" : "Đặt BÁN"} ${esc(sel.asset_code)}</button>` : '<a class="btn block" href="#/account">Đăng nhập để giao dịch</a>'}
+        </form>
+      </div>
+      <div class="card t-trades"><h3>Khớp lệnh gần đây</h3><div id="t-trades"></div></div>
+    </div>
+    <div class="card">
+      <div class="tabs">${[["open", "Lệnh chờ"], ["history", "Lịch sử lệnh"], ["fills", "Khớp của tôi"], ["alerts", "Cảnh báo giá"]].map(([k, l]) => `<button class="tab ${ts.tab === k ? "active" : ""}" data-action="otab" data-k="${k}">${l}</button>`).join("")}</div>
+      <div id="t-orders"></div>
+    </div>`);
+
+  const form = document.getElementById("order-form");
+  const sumEl = document.getElementById("t-sum");
+  const updateSum = () => {
+    const q = Number(form.qty.value) || 0;
+    const p = ts.type === "MARKET" ? Number(ts.side === "BUY" ? m.ceiling : m.last) : Number(form.price.value) || 0;
+    const val = q * p;
+    const f = Math.floor(val * fee);
+    const t = ts.side === "SELL" ? Math.floor(val * tax) : 0;
+    const avail = bal ? (ts.side === "BUY" ? `${vnd(bal.cash.available)}` : `${num(bal.holding.available_tokens)} token`) : "—";
+    sumEl.innerHTML = `<div class="kv"><span>Khả dụng</span><b>${avail}</b></div>
+      <div class="kv"><span>Giá trị${ts.type === "MARKET" ? " (ước tính)" : ""}</span><b>${vnd(Math.round(val))}</b></div>
+      <div class="kv"><span>Phí ${pct(state.meta.fees.trade_fee_bps)}${ts.side === "SELL" ? ` + thuế ${pct(state.meta.fees.sell_tax_bps)}` : ""}</span><b>${vnd(f + t)}</b></div>
+      <div class="kv"><span>${ts.side === "BUY" ? "Tổng thanh toán" : "Thực nhận"}</span><b>${vnd(ts.side === "BUY" ? val + f : val - f - t)}</b></div>`;
+  };
+  form.addEventListener("input", updateSum);
+  ts.form = { form, updateSum, assetId, get m() { return m; }, get bal() { return bal; } };
+
+  const loadHead = async () => {
+    m = await api(`/api/market/${assetId}/summary`);
+    const t = state.meta.asset_types[sel.asset_type];
+    document.getElementById("t-head").innerHTML = `
+      <div class="row between"><select id="t-select" aria-label="Chọn mã">${board.map((b) => `<option value="${esc(b.id)}" ${b.id === assetId ? "selected" : ""}>${esc(b.asset_code)} – ${esc(b.title.slice(0, 40))}</option>`).join("")}</select>
+        <button class="star ${watchlist().has(assetId) ? "on" : ""}" data-action="watch" data-id="${esc(assetId)}">★</button></div>
+      <div class="row t-price"><span class="big ${pcls(m.last, m)}">${num(m.last)}</span><span class="chgbox ${pcls(m.last, m)}">${chg(m)} (${chgPct(m)})</span>${sel.status === "HALTED_PLANNING" ? pill("HALTED_PLANNING") : ""}</div>
+      <div class="t-stats small">
+        <div><span class="muted">TC</span> <b class="c-ref">${num(m.ref)}</b></div><div><span class="muted">Trần</span> <b class="c-ceil">${num(m.ceiling)}</b></div><div><span class="muted">Sàn</span> <b class="c-floor">${num(m.floor)}</b></div>
+        <div><span class="muted">Cao</span> <b>${m.high ? num(m.high) : "—"}</b></div><div><span class="muted">Thấp</span> <b>${m.low ? num(m.low) : "—"}</b></div><div><span class="muted">KL</span> <b>${num(m.volume)}</b></div>
+        <div><span class="muted">GT</span> <b>${num(m.value)}</b></div><div><span class="muted">KL 24h</span> <b>${num(m.volume_24h)}</b></div><div><span class="muted">${esc(t?.icon || "")}</span> <b>${esc(t?.label || "")}</b></div>
+      </div>`;
+    document.getElementById("t-select").addEventListener("change", (e) => {
+      location.hash = `#/trade/${e.target.value}`;
+    });
+  };
+  const loadChart = async () => {
+    document.getElementById("t-chart").innerHTML = candleChart(await api(`/api/market/${assetId}/candles?interval=${ts.interval}&limit=120`));
+  };
+  const loadBook = async () => {
+    const el = document.getElementById("t-book");
+    el.innerHTML = bookHtml(await api(`/api/market/${assetId}/depth`), m);
+    applyDynamic(el);
+  };
+  const loadTrades = async () => {
+    const tr = await api(`/api/market/${assetId}/trades?limit=30`);
+    document.getElementById("t-trades").innerHTML = `<div class="trades-list small"><div class="muted"><span>Giờ</span><span>Giá</span><span>KL</span></div>${tr
+      .map((x) => `<div><span class="muted">${esc(date(x.created_at).split(" ")[0])}</span><span class="${x.taker_side === "BUY" ? "up" : "down"}">${num(x.price)}</span><span>${num(x.quantity)}</span></div>`)
+      .join("")}</div>`;
+  };
+  const loadMine = async () => {
+    const el = document.getElementById("t-orders");
+    if (!state.me) {
+      el.innerHTML = '<p class="muted small">Đăng nhập để xem lệnh của bạn.</p>';
+      return;
+    }
+    bal = await api(`/api/exchange/balance?asset_id=${assetId}`);
+    updateSum();
+    const OT = { LIMIT: "LO", MARKET: "MP", STOP_LIMIT: "Dừng" };
+    const OS = { OPEN: "Chờ khớp", PARTIAL: "Khớp 1 phần", PENDING_TRIGGER: "Chờ kích hoạt", FILLED: "Đã khớp", CANCELLED: "Đã hủy" };
+    if (ts.tab === "open" || ts.tab === "history") {
+      const list = await api(`/api/exchange/orders?status=${ts.tab}`);
+      el.innerHTML = `<div class="table-wrap"><table><tr><th>Mã</th><th>Lệnh</th><th class="num">Giá</th><th class="num">KL khớp/đặt</th><th>Trạng thái</th><th></th></tr>
+        ${list.map((o) => `<tr><td>${esc(o.asset_code)}</td><td class="${o.side === "BUY" ? "up" : "down"}">${o.side === "BUY" ? "Mua" : "Bán"} ${OT[o.type]}</td>
+          <td class="num">${o.price ? num(o.price) : "MP"}${o.stop_price ? `<div class="small muted">KH ${num(o.stop_price)}</div>` : ""}</td><td class="num">${num(o.filled_quantity)}/${num(o.quantity)}</td>
+          <td class="small">${esc(OS[o.status])}${o.cancel_reason && o.cancel_reason !== "USER" ? `<div class="muted">${esc(o.cancel_reason)}</div>` : ""}</td>
+          <td class="num">${ts.tab === "open" ? `<button class="btn sm ghost" data-action="cancel-xorder" data-id="${esc(o.id)}">Hủy</button>` : ""}</td></tr>`).join("") || '<tr><td colspan="6" class="muted">Không có lệnh.</td></tr>'}</table></div>`;
+    } else if (ts.tab === "fills") {
+      const list = await api("/api/exchange/my-trades");
+      el.innerHTML = `<div class="table-wrap"><table><tr><th>Thời gian</th><th>Mã</th><th>Chiều</th><th class="num">Giá</th><th class="num">KL</th><th class="num">Phí+thuế</th></tr>
+        ${list.map((t) => `<tr><td class="small">${esc(date(t.created_at))}</td><td>${esc(t.asset_code)}</td><td class="${t.side === "BUY" ? "up" : "down"}">${t.side === "BUY" ? "Mua" : "Bán"}</td><td class="num">${num(t.price)}</td><td class="num">${num(t.quantity)}</td><td class="num">${num(big(t.fee) + big(t.tax))}</td></tr>`).join("") || '<tr><td colspan="6" class="muted">Chưa có giao dịch khớp.</td></tr>'}</table></div>`;
+    } else {
+      const list = await api("/api/alerts");
+      el.innerHTML = `<form data-form="alert" class="row alert-form"><select name="direction"><option value="ABOVE">Giá ≥</option><option value="BELOW">Giá ≤</option></select>
+          <input name="price" inputmode="numeric" placeholder="Mức giá" required /><button class="btn sm">Tạo cảnh báo ${esc(sel.asset_code)}</button></form>
+        <table><tr><th>Mã</th><th>Điều kiện</th><th>Trạng thái</th><th></th></tr>
+        ${list.map((a) => `<tr><td>${esc(a.asset_code)}</td><td>${a.direction === "ABOVE" ? "≥" : "≤"} ${num(a.price)}</td><td class="small">${Number(a.active) ? "Đang theo dõi" : `Đã báo ${esc(date(a.triggered_at))}`}</td><td class="num"><button class="btn sm ghost" data-action="del-alert" data-id="${esc(a.id)}">Xóa</button></td></tr>`).join("") || '<tr><td colspan="4" class="muted">Chưa có cảnh báo.</td></tr>'}</table>`;
+    }
+  };
+  ts.reloadMine = loadMine;
+  ts.reloadChart = loadChart;
+  await loadHead();
+  await Promise.all([loadChart(), loadBook(), loadTrades(), loadMine()]);
+  updateSum();
+  state.onMarket = (ids) => {
+    if (!ids.includes(assetId)) return;
+    loadHead()
+      .then(() => Promise.all([loadBook(), loadTrades(), loadChart(), loadMine()]))
+      .catch(() => {});
+  };
 }
 
 async function viewCert(assetId) {
@@ -537,7 +831,7 @@ async function viewAccount() {
       <div class="kv"><span>eKYC</span><b>${pill(u.kyc_status === "VERIFIED" ? "ACTIVE" : u.kyc_status === "REJECTED" ? "HALTED_PLANNING" : "PENDING_REVIEW", { UNSUBMITTED: "Chưa xác thực", PENDING: "Đang duyệt", VERIFIED: "Đã xác thực", REJECTED: "Bị từ chối" }[u.kyc_status])}</b></div>
       ${u.cccd_masked ? `<div class="kv"><span>CCCD</span><b>${esc(u.cccd_masked)}</b></div>` : ""}
       ${u.bank_account_masked ? `<div class="kv"><span>Tài khoản nhận tiền</span><b>${esc(u.bank_name)} ${esc(u.bank_account_masked)}</b></div>` : ""}
-      <button class="btn ghost sm" data-action="logout">Đăng xuất</button></div>
+      <div class="row"><a class="btn ghost sm" href="#/notifications">🔔 Thông báo</a>${u.role !== "INVESTOR" ? '<a class="btn ghost sm" href="#/list-asset">➕ Niêm yết tài sản</a>' : ""}<button class="btn ghost sm" data-action="logout">Đăng xuất</button></div></div>
     ${
       u.kyc_status === "UNSUBMITTED" || u.kyc_status === "REJECTED"
         ? `<div class="card"><h3>Xác thực danh tính (eKYC)</h3>
@@ -633,7 +927,7 @@ async function viewAdmin(tab) {
   } else if (tab === "batches") {
     body = `<div class="notice">Hệ thống <b>không tự chuyển tiền</b>. Tải bảng kê CSV, duyệt chi thủ công trên ứng dụng ngân hàng, rồi bấm “Xác nhận đã chi”.</div>
       <div class="card table-wrap"><table><tr><th>Ngày</th><th>TS</th><th>Loại</th><th class="num">Số dòng</th><th class="num">Tổng tiền</th><th>Trạng thái</th><th></th></tr>
-      ${o.batches.map((b) => `<tr><td class="small">${esc(date(b.created_at))}</td><td>${esc(b.asset_code)}</td><td>${esc(b.kind)}</td><td class="num">${num(b.line_count)}</td><td class="num">${num(b.total_amount)}</td><td>${b.status === "PAID" ? pill("ACTIVE", "Đã chi") : pill("PENDING_REVIEW", "Chờ duyệt")}</td>
+      ${o.batches.map((b) => `<tr><td class="small">${esc(date(b.created_at))}</td><td>${esc(b.asset_code || "Ví")}</td><td>${esc(b.kind)}</td><td class="num">${num(b.line_count)}</td><td class="num">${num(b.total_amount)}</td><td>${b.status === "PAID" ? pill("ACTIVE", "Đã chi") : pill("PENDING_REVIEW", "Chờ duyệt")}</td>
         <td class="num"><button class="btn sm ghost" data-action="adm-csv" data-id="${esc(b.id)}">CSV</button>${b.status !== "PAID" ? ` <button class="btn sm" data-action="adm-paid" data-id="${esc(b.id)}">Xác nhận đã chi</button>` : ""}</td></tr>`).join("")}</table></div>`;
   } else if (tab === "spv") {
     body = `${o.spvs.map((s) => `<div class="card"><b>${esc(s.company_name)}</b><div class="small muted">MST ${esc(s.tax_code)} · Lưu ký: ${esc(s.bank_custodian_name)}</div></div>`).join("")}
@@ -652,7 +946,9 @@ async function viewAdmin(tab) {
   render(`<div class="grid three">
       <div class="card"><div class="small muted">Người dùng</div><div class="big">${num(o.stats.users)}</div></div>
       <div class="card"><div class="small muted">Tiền vào tài khoản phong tỏa</div><div class="big">${vnd(o.stats.escrow_inflow)}</div></div>
-      <div class="card"><div class="small muted">Chờ duyệt chi</div><div class="big">${vnd(o.stats.pending_payout)}</div></div></div>
+      <div class="card"><div class="small muted">Chờ duyệt chi</div><div class="big">${vnd(o.stats.pending_payout)}</div></div>
+      <div class="card"><div class="small muted">Tổng giá trị khớp lệnh</div><div class="big">${vnd(o.stats.trade_value)}</div></div>
+      <div class="card"><div class="small muted">Doanh thu phí giao dịch</div><div class="big">${vnd(o.stats.fee_revenue)}</div></div></div>
     <div class="tabs">${tabs.map(([k, l]) => `<a class="tab ${tab === k ? "active" : ""}" href="#/admin/${k}">${l}</a>`).join("")}</div>${body}`);
 }
 
@@ -663,6 +959,32 @@ function previewTable(lines, amountKey = "amount") {
 
 // ---------- xử lý sự kiện ----------
 const forms = {
+  async order(f) {
+    const body = { asset_id: ts.form.assetId, side: ts.side, type: ts.type, quantity: f.qty.value.trim() };
+    if (ts.type !== "MARKET") body.price = f.price.value.trim();
+    if (ts.type === "STOP_LIMIT") body.stop_price = f.stop_price.value.trim();
+    const o = await api("/api/exchange/orders", { method: "POST", body });
+    const msg = { FILLED: "Lệnh đã khớp toàn bộ", PARTIAL: "Lệnh khớp một phần, phần còn lại chờ khớp", OPEN: "Đã đặt lệnh, đang chờ khớp", PENDING_TRIGGER: "Lệnh điều kiện đang chờ kích hoạt", CANCELLED: "Lệnh MP: không còn thanh khoản, phần chưa khớp đã hủy" }[o.status];
+    toast(`${msg} (${num(o.filled_quantity)}/${num(o.quantity)})`);
+    f.qty.value = "";
+    await ts.reloadMine();
+  },
+  async alert(f) {
+    await api("/api/alerts", { method: "POST", body: { asset_id: ts.form.assetId, direction: f.direction.value, price: f.price.value.trim() } });
+    toast("Đã tạo cảnh báo giá");
+    await ts.reloadMine();
+  },
+  async deposit(f) {
+    const r = await api("/api/wallet/deposit", { method: "POST", body: { amount: f.amount.value.trim() } });
+    closeModal();
+    location.hash = `#/pay/${r.transaction_id}`;
+  },
+  async withdraw(f) {
+    await api("/api/wallet/withdraw", { method: "POST", body: { amount: f.amount.value.trim() } });
+    closeModal();
+    toast("Đã gửi yêu cầu rút tiền. Tiền về tài khoản chính chủ sau khi ngân hàng duyệt chi.");
+    router();
+  },
   search(f) {
     const q = f.q.value.trim();
     const type = new URLSearchParams(location.hash.split("?")[1] || "").get("type");
@@ -692,18 +1014,17 @@ const forms = {
     router();
   },
   async "buy-primary"(f) {
-    const r = await api("/api/orders/create", { method: "POST", body: { asset_id: currentAsset.id, token_amount: f.qty.value } });
+    const r = await api("/api/orders/create", {
+      method: "POST",
+      body: { asset_id: currentAsset.id, token_amount: f.qty.value, from_wallet: !!f.from_wallet?.checked },
+    });
+    if (r.paid_from_wallet) {
+      closeModal();
+      toast("Đã mua bằng số dư ví. Token chờ hoàn tất gọi vốn.");
+      location.hash = "#/portfolio";
+      return;
+    }
     location.hash = `#/pay/${r.transaction_id}`;
-  },
-  async "buy-otc"(f) {
-    const r = await api("/api/orders/create", { method: "POST", body: { listing_id: f.listing_id.value, token_amount: f.qty.value } });
-    location.hash = `#/pay/${r.transaction_id}`;
-  },
-  async sell(f) {
-    await api("/api/otc/listings", { method: "POST", body: { asset_id: f.asset_id.value, token_amount: f.qty.value, price_per_token: f.price.value } });
-    closeModal();
-    toast("Đã đặt lệnh bán. Token được khóa cho tới khi khớp hoặc hủy.");
-    router();
   },
   async proposal(f) {
     const type = f.proposal_type.value;
@@ -804,6 +1125,83 @@ const forms = {
 };
 
 const actions = {
+  watch(el) {
+    toggleWatch(el.dataset.id);
+    el.classList.toggle("on");
+  },
+  "board-mode"() {
+    localStorage.setItem("tvn_board_full", localStorage.getItem("tvn_board_full") === "1" ? "0" : "1");
+    router();
+  },
+  side(el) {
+    ts.side = el.dataset.s;
+    router();
+  },
+  otype(el) {
+    ts.type = el.dataset.t;
+    router();
+  },
+  async interval(el) {
+    ts.interval = el.dataset.i;
+    for (const b of document.querySelectorAll("#t-int button")) b.classList.toggle("on", b === el);
+    await ts.reloadChart();
+  },
+  async otab(el) {
+    ts.tab = el.dataset.k;
+    for (const b of el.parentElement.querySelectorAll(".tab")) b.classList.toggle("active", b === el);
+    await ts.reloadMine();
+  },
+  "pick-price"(el) {
+    const f = ts.form?.form;
+    if (!f || ts.type === "MARKET") return;
+    f.price.value = el.dataset.price;
+    ts.form.updateSum();
+  },
+  step(el) {
+    const f = ts.form.form;
+    const tick = Number(state.meta.fees.tick_size);
+    const v = (Number(f.price.value) || Number(ts.form.m.last)) + Number(el.dataset.d) * tick;
+    f.price.value = String(Math.max(tick, Math.round(v / tick) * tick));
+    ts.form.updateSum();
+  },
+  pct(el) {
+    const { form, bal, m } = ts.form;
+    if (!bal) return toast("Đăng nhập để dùng tính năng này", true);
+    const p = Number(el.dataset.p) / 100;
+    if (ts.side === "SELL") {
+      form.qty.value = String(Math.floor(Number(bal.holding.available_tokens) * p));
+    } else {
+      const price = ts.type === "MARKET" ? Number(m.ceiling) : Number(form.price.value) || Number(m.last);
+      const per = price * (1 + Number(state.meta.fees.trade_fee_bps) / 10000);
+      form.qty.value = String(Math.floor((Number(bal.cash.available) * p) / per));
+    }
+    ts.form.updateSum();
+  },
+  async "cancel-xorder"(el) {
+    await api(`/api/exchange/orders/${el.dataset.id}/cancel`, { method: "POST", body: {} });
+    toast("Đã hủy lệnh");
+    await ts.reloadMine();
+  },
+  async "del-alert"(el) {
+    await api(`/api/alerts/${el.dataset.id}/delete`, { method: "POST", body: {} });
+    await ts.reloadMine();
+  },
+  deposit() {
+    openModal(`<h2>Nạp tiền vào ví</h2><form data-form="deposit">
+      <div class="field"><label>Số tiền (VND)</label><input name="amount" inputmode="numeric" value="10000000" required /></div>
+      <div class="row">${[5, 10, 50, 100].map((x) => `<button type="button" class="chip" data-action="set-amount" data-v="${x * 1000000}">${x} triệu</button>`).join("")}</div>
+      <p class="small muted">Hệ thống cấp mã VietQR định danh riêng. Tiền nằm trong tài khoản phong tỏa tại ngân hàng đối tác, được ghi có vào ví ngay khi ngân hàng báo có.</p>
+      <div class="row"><button class="btn gold">Lấy mã QR</button><button type="button" class="btn ghost" data-action="close">Hủy</button></div></form>`);
+  },
+  "set-amount"(el) {
+    el.closest("form").amount.value = el.dataset.v;
+  },
+  withdraw(el) {
+    openModal(`<h2>Rút tiền</h2><form data-form="withdraw">
+      <div class="field"><label>Số tiền (khả dụng ${vnd(el.dataset.max)})</label><input name="amount" inputmode="numeric" required /></div>
+      <p class="small muted">Tiền chỉ được chuyển về tài khoản ngân hàng chính chủ đã xác thực eKYC (${esc(state.me?.bank_name || "")} ${esc(state.me?.bank_account_masked || "")}).</p>
+      <div class="row"><button class="btn">Gửi yêu cầu rút</button><button type="button" class="btn ghost" data-action="close">Hủy</button></div></form>`);
+  },
   close: closeModal,
   print: () => window.print(),
   logout() {
@@ -815,18 +1213,7 @@ const actions = {
     if (!state.me) return (location.hash = "#/account");
     const a = currentAsset;
     const max = big(a.total_tokens) - big(a.sold_tokens) - big(a.reserved_tokens);
-    qtyModal({ title: `Mua suất đầu tư ${a.asset_code}`, max: max.toString(), price: a.token_price, action: "buy-primary" });
-  },
-  "buy-otc"(el) {
-    if (!state.me) return (location.hash = "#/account");
-    qtyModal({ title: "Mua token trên thị trường OTC", max: el.dataset.max, price: el.dataset.price, action: "buy-otc", extra: `<input type="hidden" name="listing_id" value="${esc(el.dataset.id)}" />` });
-  },
-  sell(el) {
-    openModal(`<h2>Đặt lệnh bán OTC</h2><form data-form="sell"><input type="hidden" name="asset_id" value="${esc(el.dataset.asset)}" />
-      <div class="field"><label>Số lượng (khả dụng ${num(el.dataset.max)})</label><input name="qty" type="number" min="1" max="${esc(el.dataset.max)}" required /></div>
-      <div class="field"><label>Giá chào bán / token (VND)</label><input name="price" type="number" min="1000" step="100" value="${esc(el.dataset.price)}" required /></div>
-      <p class="small muted">Phí giao dịch ${pct(state.meta.fees.otc_fee_bps)} trừ vào tiền nhận. Tiền bán sẽ được giải ngân về tài khoản chính chủ qua bảng kê chi của ngân hàng.</p>
-      <div class="row"><button class="btn">Đặt bán</button><button type="button" class="btn ghost" data-action="close">Hủy</button></div></form>`);
+    qtyModal({ title: `Mua suất đầu tư ${a.asset_code}`, max: max.toString(), price: a.token_price, action: "buy-primary", wallet: true });
   },
   async vote(el) {
     if (!confirm(`Xác nhận biểu quyết "${el.dataset.d === "AGREE" ? "Đồng ý" : "Phản đối"}"? Token của bạn sẽ bị khóa chuyển nhượng tới khi kết thúc biểu quyết.`)) return;
@@ -842,11 +1229,6 @@ const actions = {
   async "cancel-order"(el) {
     await api(`/api/orders/${el.dataset.id}/cancel`, { method: "POST", body: {} });
     toast("Đã hủy đơn");
-    router();
-  },
-  async "cancel-listing"(el) {
-    await api(`/api/otc/listings/${el.dataset.id}/cancel`, { method: "POST", body: {} });
-    toast("Đã hủy lệnh bán");
     router();
   },
   async "adm-kyc"(el) {
@@ -925,6 +1307,11 @@ const actions = {
 };
 
 document.addEventListener("click", async (e) => {
+  const row = e.target.closest("tr[data-href]");
+  if (row && !e.target.closest("[data-action]")) {
+    location.hash = row.dataset.href;
+    return;
+  }
   const el = e.target.closest("[data-action]");
   if (!el || !actions[el.dataset.action]) return;
   e.preventDefault();
@@ -955,5 +1342,6 @@ window.addEventListener("hashchange", router);
 (async () => {
   state.meta = await api("/api/meta");
   await refreshMe();
+  startStream();
   router();
 })();

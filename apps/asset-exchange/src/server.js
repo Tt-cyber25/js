@@ -46,6 +46,21 @@ const publicUser = (u) =>
 
 export function createApp({ config = defaultConfig, db = openDb(config.dbPath) } = {}) {
   const ledger = createLedger(db, config);
+  const ex = ledger.exchange;
+
+  // Luồng dữ liệu thị trường thời gian thực (Server-Sent Events): báo mã tài sản vừa thay đổi
+  const streams = new Set();
+  const pending = new Set();
+  let flushTimer = null;
+  ex.events.on("market", (assetId) => {
+    pending.add(assetId);
+    flushTimer ??= setTimeout(() => {
+      const msg = `event: market\ndata: ${JSON.stringify([...pending])}\n\n`;
+      pending.clear();
+      flushTimer = null;
+      for (const r of streams) r.write(msg);
+    }, 150);
+  });
   const routes = [];
   const route = (method, pattern, opts, handler) => {
     const keys = [];
@@ -87,7 +102,14 @@ export function createApp({ config = defaultConfig, db = openDb(config.dbPath) }
   route("GET", "/api/meta", {}, () => ({
     asset_types: ASSET_TYPES,
     allow_bank_simulator: config.allowBankSimulator,
-    fees: { platform_fee_bps: config.platformFeeBps, otc_fee_bps: config.otcFeeBps, dividend_tax_bps: config.dividendTaxBps },
+    fees: {
+      platform_fee_bps: config.platformFeeBps,
+      trade_fee_bps: config.tradeFeeBps,
+      sell_tax_bps: config.sellTaxBps,
+      dividend_tax_bps: config.dividendTaxBps,
+      band_bps: config.bandBps,
+      tick_size: config.tickSize,
+    },
   }));
 
   route("POST", "/api/auth/register", {}, ({ body, ip }) => {
@@ -141,13 +163,7 @@ export function createApp({ config = defaultConfig, db = openDb(config.dbPath) }
       price_history: db.all("SELECT price, recorded_at FROM price_history WHERE asset_id = ? ORDER BY id", a.id),
       income_reports: db.all("SELECT period, gross_amount, platform_fee, operator_reward, tax_total, net_paid FROM income_reports WHERE asset_id = ? ORDER BY period", a.id),
       proposals,
-      listings: db.all(
-        `SELECT l.id, l.remaining_tokens - l.reserved_tokens AS available, l.price_per_token, l.created_at, l.seller_id = ? AS mine
-           FROM otc_listings l WHERE l.asset_id = ? AND l.status = 'OPEN' AND l.remaining_tokens > l.reserved_tokens
-          ORDER BY l.price_per_token, l.created_at`,
-        user?.id ?? "",
-        a.id,
-      ),
+      market: ["ACTIVE", "HALTED_PLANNING", "DELISTED"].includes(a.status) ? ex.summary(a) : null,
       holder_count: holders.length,
       my_holding: user ? (db.get("SELECT available_tokens, locked_tokens, avg_buy_price FROM user_holdings WHERE user_id = ? AND asset_id = ?", user.id, a.id) ?? null) : null,
     };
@@ -201,17 +217,15 @@ export function createApp({ config = defaultConfig, db = openDb(config.dbPath) }
       });
     const transactions = db.all(
       `SELECT t.id, t.reference_code, t.type, t.token_amount, t.fiat_amount, t.fee_amount, t.tax_amount, t.net_amount, t.status, t.note, t.created_at, a.asset_code
-         FROM transactions t JOIN assets a ON a.id = t.asset_id WHERE t.user_id = ? ORDER BY t.created_at DESC, t.rowid DESC LIMIT 200`,
+         FROM transactions t LEFT JOIN assets a ON a.id = t.asset_id WHERE t.user_id = ? ORDER BY t.created_at DESC, t.rowid DESC LIMIT 200`,
       user.id,
     );
-    const listings = db.all(
-      `SELECT l.id, l.remaining_tokens, l.reserved_tokens, l.price_per_token, l.status, a.asset_code FROM otc_listings l
-         JOIN assets a ON a.id = l.asset_id WHERE l.seller_id = ? AND l.status = 'OPEN'`,
-      user.id,
-    );
-    const net_worth = holdings.reduce((s, h) => s + h.market_value, 0n);
+    const wallet = ex.cash(user.id);
+    const securities_value = holdings.reduce((s, h) => s + h.market_value, 0n);
+    const cost_total = holdings.reduce((s, h) => s + h.cost_basis, 0n);
+    const net_worth = securities_value + wallet.available + wallet.locked;
     const dividends_total = transactions.filter((t) => t.type === "DIVIDEND").reduce((s, t) => s + t.net_amount, 0n);
-    return { holdings, transactions, listings, net_worth, dividends_total };
+    return { holdings, transactions, wallet, securities_value, cost_total, net_worth, dividends_total };
   });
 
   // Giấy xác nhận sở hữu (dấu niêm phong số SHA-256 trên nội dung xác nhận)
@@ -235,14 +249,12 @@ export function createApp({ config = defaultConfig, db = openDb(config.dbPath) }
   });
 
   route("POST", "/api/orders/create", { auth: true }, ({ user, body }) =>
-    body.listing_id
-      ? ledger.createOtcOrder(user.id, String(body.listing_id), body.token_amount)
-      : ledger.createPrimaryOrder(user.id, String(body.asset_id || ""), body.token_amount),
+    ledger.createPrimaryOrder(user.id, String(body.asset_id || ""), body.token_amount, { fromWallet: body.from_wallet === true }),
   );
   route("GET", "/api/orders/:id", { auth: true }, ({ user, params }) => {
     const t = db.get("SELECT * FROM transactions WHERE id = ? AND user_id = ?", params.id, user.id);
     if (!t) throw new HttpError(404, "Không tìm thấy đơn");
-    const asset = db.get("SELECT id, asset_code, title FROM assets WHERE id = ?", t.asset_id);
+    const asset = t.asset_id ? db.get("SELECT id, asset_code, title FROM assets WHERE id = ?", t.asset_id) : null;
     return {
       id: t.id,
       reference_code: t.reference_code,
@@ -260,11 +272,86 @@ export function createApp({ config = defaultConfig, db = openDb(config.dbPath) }
     return { ok: true };
   });
 
-  route("POST", "/api/otc/listings", { auth: true }, ({ user, body }) => ({
-    id: ledger.createOtcListing(user.id, String(body.asset_id || ""), body.token_amount, body.price_per_token),
+  // ---------------- SÀN GIAO DỊCH ----------------
+  const tradable = (id) => {
+    const a = db.get("SELECT * FROM assets WHERE id = ? OR asset_code = ?", id, id);
+    if (!a || ["PENDING_REVIEW", "DRAFT"].includes(a.status)) throw new HttpError(404, "Không tìm thấy tài sản");
+    return a;
+  };
+  route("GET", "/api/market/board", {}, () =>
+    db
+      .all("SELECT * FROM assets WHERE status IN ('ACTIVE','HALTED_PLANNING') ORDER BY asset_type, asset_code")
+      .map((a) => ({ id: a.id, asset_code: a.asset_code, asset_type: a.asset_type, title: a.title, status: a.status, total_tokens: a.total_tokens, ...ex.summary(a) })),
+  );
+  route("GET", "/api/market/:id/depth", {}, ({ params }) => ex.depth(tradable(params.id).id, 15));
+  route("GET", "/api/market/:id/trades", {}, ({ params, query }) => ex.recentTrades(tradable(params.id).id, query.get("limit")));
+  route("GET", "/api/market/:id/candles", {}, ({ params, query }) => ex.candles(tradable(params.id).id, query.get("interval") || "1h", query.get("limit")));
+  route("GET", "/api/market/:id/summary", {}, ({ params }) => ex.summary(tradable(params.id)));
+
+  route("POST", "/api/exchange/orders", { auth: true }, ({ user, body }) => ex.placeOrder(user.id, body));
+  route("GET", "/api/exchange/orders", { auth: true }, ({ user, query }) => {
+    const open = query.get("status") !== "history";
+    const assetId = query.get("asset_id");
+    return db.all(
+      `SELECT o.*, a.asset_code FROM orders o JOIN assets a ON a.id = o.asset_id
+        WHERE o.user_id = ? AND ${open ? "o.status IN ('OPEN','PARTIAL','PENDING_TRIGGER')" : "o.status IN ('FILLED','CANCELLED')"}
+          ${assetId ? "AND o.asset_id = ?" : ""}
+        ORDER BY o.rowid DESC LIMIT 100`,
+      user.id,
+      ...(assetId ? [assetId] : []),
+    );
+  });
+  route("GET", "/api/exchange/balance", { auth: true }, ({ user, query }) => {
+    const assetId = query.get("asset_id") || "";
+    return {
+      cash: ex.cash(user.id),
+      holding: db.get("SELECT available_tokens, locked_tokens, avg_buy_price FROM user_holdings WHERE user_id = ? AND asset_id = ?", user.id, assetId) ?? {
+        available_tokens: 0n,
+        locked_tokens: 0n,
+        avg_buy_price: 0n,
+      },
+    };
+  });
+  route("POST", "/api/exchange/orders/:id/cancel", { auth: true }, ({ user, params }) => {
+    ex.cancelOrder(user.id, params.id);
+    return { ok: true };
+  });
+  route("GET", "/api/exchange/my-trades", { auth: true }, ({ user }) =>
+    db.all(
+      `SELECT t.id, t.price, t.quantity, t.created_at, a.asset_code,
+              CASE WHEN t.buyer_id = ? THEN 'BUY' ELSE 'SELL' END AS side,
+              CASE WHEN t.buyer_id = ? THEN t.buyer_fee ELSE t.seller_fee END AS fee,
+              CASE WHEN t.buyer_id = ? THEN 0 ELSE t.seller_tax END AS tax
+         FROM trades t JOIN assets a ON a.id = t.asset_id WHERE t.buyer_id = ? OR t.seller_id = ? ORDER BY t.id DESC LIMIT 200`,
+      user.id,
+      user.id,
+      user.id,
+      user.id,
+      user.id,
+    ),
+  );
+
+  route("GET", "/api/wallet", { auth: true }, ({ user }) => ({
+    ...ex.cash(user.id),
+    bank_name: user.bank_name,
+    bank_account_masked: publicUser(user).bank_account_masked,
+    history: db.all(
+      "SELECT id, reference_code, type, fiat_amount, status, created_at FROM transactions WHERE user_id = ? AND type IN ('DEPOSIT','WITHDRAWAL') ORDER BY rowid DESC LIMIT 50",
+      user.id,
+    ),
   }));
-  route("POST", "/api/otc/listings/:id/cancel", { auth: true }, ({ user, params }) => {
-    ledger.cancelListing(user.id, params.id);
+  route("POST", "/api/wallet/deposit", { auth: true }, ({ user, body }) => ex.createDeposit(user.id, body.amount));
+  route("POST", "/api/wallet/withdraw", { auth: true }, ({ user, body }) => ex.requestWithdrawal(user.id, body.amount));
+
+  route("GET", "/api/alerts", { auth: true }, ({ user }) =>
+    db.all(
+      "SELECT al.*, a.asset_code FROM price_alerts al JOIN assets a ON a.id = al.asset_id WHERE al.user_id = ? ORDER BY al.active DESC, al.created_at DESC LIMIT 100",
+      user.id,
+    ),
+  );
+  route("POST", "/api/alerts", { auth: true }, ({ user, body }) => ({ id: ex.createAlert(user.id, String(body.asset_id || ""), body.direction, body.price) }));
+  route("POST", "/api/alerts/:id/delete", { auth: true }, ({ user, params }) => {
+    ex.deleteAlert(user.id, params.id);
     return { ok: true };
   });
 
@@ -291,14 +378,16 @@ export function createApp({ config = defaultConfig, db = openDb(config.dbPath) }
     assets: db.all("SELECT * FROM assets ORDER BY created_at DESC").map(assetView),
     spvs: db.all("SELECT * FROM spv_entities"),
     batches: db.all(
-      "SELECT b.*, a.asset_code FROM payout_batches b JOIN assets a ON a.id = b.asset_id ORDER BY b.created_at DESC, b.rowid DESC LIMIT 100",
+      "SELECT b.*, a.asset_code FROM payout_batches b LEFT JOIN assets a ON a.id = b.asset_id ORDER BY b.created_at DESC, b.rowid DESC LIMIT 100",
     ),
     proposals: db.all(
       "SELECT p.*, a.asset_code FROM governance_proposals p JOIN assets a ON a.id = p.asset_id WHERE p.status = 'APPROVED' AND p.proposal_type <> 'VALUE_ADD_5_10_PERCENT'",
     ),
     stats: {
       users: db.get("SELECT COUNT(*) AS n FROM users").n,
-      escrow_inflow: db.get("SELECT COALESCE(SUM(fiat_amount),0) AS s FROM transactions WHERE status = 'COMPLETED' AND type IN ('BUY_PRIMARY','BUY_OTC')").s,
+      escrow_inflow: db.get("SELECT COALESCE(SUM(fiat_amount),0) AS s FROM transactions WHERE status = 'COMPLETED' AND type IN ('BUY_PRIMARY','DEPOSIT')").s,
+      trade_value: db.get("SELECT COALESCE(SUM(price*quantity),0) AS s FROM trades").s,
+      fee_revenue: db.get("SELECT COALESCE(SUM(buyer_fee+seller_fee),0) AS s FROM trades").s,
       pending_payout: db.get("SELECT COALESCE(SUM(total_amount),0) AS s FROM payout_batches WHERE status = 'PENDING_APPROVAL'").s,
     },
   }));
@@ -391,6 +480,18 @@ export function createApp({ config = defaultConfig, db = openDb(config.dbPath) }
   async function handler(req, res) {
     for (const [k, v] of Object.entries(SECURITY_HEADERS)) res.setHeader(k, v);
     const url = new URL(req.url, "http://localhost");
+    if (url.pathname === "/api/stream" && req.method === "GET") {
+      if (streams.size > 1000) return res.writeHead(503).end();
+      res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" });
+      res.write("retry: 3000\n\n");
+      streams.add(res);
+      const ping = setInterval(() => res.write(": ping\n\n"), 25000);
+      req.on("close", () => {
+        clearInterval(ping);
+        streams.delete(res);
+      });
+      return;
+    }
     if (!url.pathname.startsWith("/api/")) {
       if (req.method !== "GET" && req.method !== "HEAD") return res.writeHead(405).end();
       return serveStatic(req, res, url.pathname);
