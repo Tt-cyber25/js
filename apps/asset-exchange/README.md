@@ -70,7 +70,7 @@ Tài khoản demo (mật khẩu `Demo@12345`): `admin@demo.vn`, `owner@demo.vn`,
   - Chủ cũ nắm trên 90% (Drag-Along): bán lãi thì chia theo tỷ lệ; bán lỗ thì cổ đông nhỏ được ưu tiên nhận đủ mệnh giá gốc, chủ cũ chịu phần lỗ.
   - Cổ đông phân tán: bắt buộc có đề xuất bán toàn bộ đã được thông qua trên 75%, sau đó chia theo tỷ lệ.
 - **Tạm ngừng khẩn cấp:** hủy mọi lệnh bán và đơn đang chờ, trả token về người bán, gửi thông báo mức CRITICAL cho toàn bộ cổ đông.
-- **Không tự chuyển tiền:** mọi khoản chi (cổ tức, tiền bán OTC, hoàn tiền, giải ngân, tất toán) chỉ tạo **bảng kê chi** để admin duyệt thủ công trên app ngân hàng. CSV đã chống chèn công thức Excel.
+- **Không tự chuyển tiền:** mọi khoản chi (cổ tức, rút tiền từ ví, hoàn tiền, giải ngân, tất toán) chỉ tạo **bảng kê chi** để admin duyệt thủ công trên app ngân hàng. CSV đã chống chèn công thức Excel.
 
 ## Bảo mật
 
