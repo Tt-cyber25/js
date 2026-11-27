@@ -1,0 +1,9 @@
+{
+  "name": "TokenVN – Sàn số hóa tài sản thực",
+  "short_name": "TokenVN",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f4f6fb",
+  "theme_color": "#0b2545",
+  "icons": [{ "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml" }]
+}
