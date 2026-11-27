@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { extname, join, normalize, sep } from "node:path";
+import { pathToFileURL } from "node:url";
 import { ASSET_TYPES } from "./assetTypes.js";
 import { HttpError, hmacHex, signJwt, verifyHmac, verifyJwt } from "./auth.js";
 import { ROOT, config as defaultConfig } from "./config.js";
@@ -433,7 +434,7 @@ export function createApp({ config = defaultConfig, db = openDb(config.dbPath) }
 }
 
 // Chạy trực tiếp: node src/server.js
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const { handler, ledger, db } = createApp();
   if (!db.get("SELECT 1 FROM users LIMIT 1")) {
     const { seed } = await import("./seed.js");

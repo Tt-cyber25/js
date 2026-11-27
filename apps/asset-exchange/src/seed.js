@@ -1,5 +1,6 @@
 // Dữ liệu mẫu cho môi trường demo. KHÔNG chạy trong production.
 import { randomUUID } from "node:crypto";
+import { pathToFileURL } from "node:url";
 import { hashPassword } from "./auth.js";
 
 export const DEMO_PASSWORD = "Demo@12345";
@@ -165,7 +166,7 @@ export function seed(ledger, db) {
   ledger.activateAsset(admin, at.id);
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const { config } = await import("./config.js");
   const { openDb } = await import("./db.js");
   const { createLedger } = await import("./ledger.js");
