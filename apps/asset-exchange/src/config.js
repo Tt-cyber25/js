@@ -49,4 +49,6 @@ export const config = {
   orderTtlMinutes: Number(env.ORDER_TTL_MINUTES || 30),
   // Cho phép API mô phỏng ngân hàng (chỉ khi không phải production)
   allowBankSimulator: !isProd,
+  // Đặt TRUST_PROXY=1 khi chạy sau reverse proxy / Cloudflare Tunnel
+  trustProxy: env.TRUST_PROXY === "1",
 };

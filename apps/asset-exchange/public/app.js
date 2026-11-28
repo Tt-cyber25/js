@@ -1343,5 +1343,6 @@ window.addEventListener("hashchange", router);
   state.meta = await api("/api/meta");
   await refreshMe();
   startStream();
+  if ("serviceWorker" in navigator) navigator.serviceWorker.register("/sw.js").catch(() => {});
   router();
 })();

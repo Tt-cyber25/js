@@ -470,7 +470,9 @@ export function createApp({ config = defaultConfig, db = openDb(config.dbPath) }
     if (file === PUBLIC_DIR || rel === "/" || !extname(file)) file = join(PUBLIC_DIR, "index.html");
     try {
       const data = await readFile(file);
-      res.writeHead(200, { "Content-Type": MIME[extname(file)] || "application/octet-stream", "Cache-Control": "no-cache" });
+      const headers = { "Content-Type": MIME[extname(file)] || "application/octet-stream", "Cache-Control": "no-cache" };
+      if (file.endsWith(`${sep}sw.js`)) headers["Service-Worker-Allowed"] = "/";
+      res.writeHead(200, headers);
       res.end(req.method === "HEAD" ? undefined : data);
     } catch {
       res.writeHead(404, { "Content-Type": "text/plain" }).end("Not found");
@@ -518,7 +520,9 @@ export function createApp({ config = defaultConfig, db = openDb(config.dbPath) }
           if (typeof body !== "object" || body === null || Array.isArray(body)) throw new HttpError(400, "Body phải là object");
         }
       }
-      const ip = req.socket.remoteAddress || "unknown";
+      // Sau reverse proxy / tunnel (TRUST_PROXY=1) lấy IP thật từ X-Forwarded-For để giới hạn đăng nhập đúng người
+      const fwd = config.trustProxy ? String(req.headers["x-forwarded-for"] || "").split(",")[0].trim() : "";
+      const ip = fwd || req.socket.remoteAddress || "unknown";
       const out = await r.handler({ req, res, params, query: url.searchParams, body, raw, user, ip });
       if (res.writableEnded) return;
       if (!res.headersSent) res.setHeader("Content-Type", "application/json; charset=utf-8");
@@ -538,9 +542,22 @@ export function createApp({ config = defaultConfig, db = openDb(config.dbPath) }
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const { handler, ledger, db } = createApp();
   if (!db.get("SELECT 1 FROM users LIMIT 1")) {
-    const { seed } = await import("./seed.js");
-    seed(ledger, db);
-    console.log("Đã khởi tạo dữ liệu mẫu (xem README để biết tài khoản demo).");
+    if (defaultConfig.isProd) {
+      // Production: KHÔNG tạo tài khoản demo có mật khẩu công khai; chỉ tạo 1 admin từ biến môi trường
+      const email = process.env.ADMIN_EMAIL;
+      const password = process.env.ADMIN_PASSWORD;
+      if (!email || !password || password.length < 12) {
+        console.error("Production lần đầu: cần ADMIN_EMAIL và ADMIN_PASSWORD (>= 12 ký tự) để tạo tài khoản quản trị.");
+        process.exit(1);
+      }
+      const u = ledger.registerUser({ full_name: "Quản trị viên", email, password });
+      db.run("UPDATE users SET role = 'ADMIN', kyc_status = 'VERIFIED' WHERE id = ?", u.id);
+      console.log(`Đã tạo tài khoản quản trị ${email}.`);
+    } else {
+      const { seed } = await import("./seed.js");
+      seed(ledger, db);
+      console.log("Đã khởi tạo dữ liệu mẫu (xem README để biết tài khoản demo).");
+    }
   }
   // Dọn đơn quá hạn & đóng biểu quyết hết hạn mỗi phút
   setInterval(() => {

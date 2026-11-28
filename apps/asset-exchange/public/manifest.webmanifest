@@ -1,9 +1,20 @@
 {
+  "id": "/",
   "name": "TokenVN – Sàn số hóa tài sản thực",
   "short_name": "TokenVN",
-  "start_url": "/",
+  "description": "Số hóa, gọi vốn chia nhỏ và giao dịch tài sản thực: bất động sản, sáng chế, công nghệ, tài sản trí tuệ, tác phẩm sáng tạo, đồ cổ.",
+  "lang": "vi",
+  "start_url": "/#/board",
+  "scope": "/",
   "display": "standalone",
+  "orientation": "portrait",
   "background_color": "#f4f6fb",
   "theme_color": "#0b2545",
-  "icons": [{ "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml" }]
+  "categories": ["finance"],
+  "icons": [
+    { "src": "/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" },
+    { "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml" }
+  ]
 }
